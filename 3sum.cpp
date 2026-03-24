@@ -24,7 +24,7 @@ vector<vector<int>> threeSum(vector<int>& nums) {
     }
 int main(){
 
-
+            printf("hello");
 
     return 0;
 }
