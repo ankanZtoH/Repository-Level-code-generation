@@ -87,3 +87,47 @@ def banner(text: str):
     print(f"{'█' * width}")
     print(f"{Colors.RESET}\n")
     sys.stdout.flush()
+
+
+
+
+
+
+
+# """
+# AI Code Agent — Logger
+# Plain structured logging: INFO, ERROR, STEP.
+# """
+
+# import sys
+# import logging
+
+# logging.basicConfig(
+#     stream=sys.stdout,
+#     format="%(asctime)s [%(levelname)s] %(message)s",
+#     datefmt="%H:%M:%S",
+#     level=logging.INFO,
+# )
+
+# _logger = logging.getLogger("agent")
+
+
+# def log(tag: str, message: str, indent: int = 0):
+#     tag = tag.upper()
+#     prefix = "  " * indent
+#     if tag == "ERROR":
+#         _logger.error(f"{prefix}{message}")
+#     elif tag in ("STEP", "RESULT", "PLAN", "ACTION", "THOUGHT",
+#                  "OBSERVATION", "FEEDBACK", "TOOL", "CONTEXT"):
+#         _logger.info(f"{prefix}[{tag}] {message}")
+#     else:
+#         _logger.info(f"{prefix}{message}")
+
+
+# def separator(title: str = ""):
+#     if title:
+#         _logger.info(f"--- {title} ---")
+
+
+# def banner(text: str):
+#     _logger.info(f"=== {text} ===")

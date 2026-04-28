@@ -7,7 +7,7 @@ body {
 }
 
 header {
-    background-color: #e94560;
+    background-image: linear-gradient(to right, #e94560, #1a1a2e);
     padding: 10px;
     transition: all 0.3s ease;
     border-radius: 10px;
@@ -36,7 +36,7 @@ section {
 }
 
 footer {
-    background-color: #e94560;
+    background-image: linear-gradient(to right, #e94560, #1a1a2e);
     color: white;
     text-align: center;
     padding: 10px;

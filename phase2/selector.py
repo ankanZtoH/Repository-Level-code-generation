@@ -1,17 +1,26 @@
 """
-AI Code Agent — Phase 2: Context Selector (Aider-inspired)
-Selects the most relevant files and code snippets for a given task.
-Uses LLM-based ranking when needed, with fast heuristic pre-filtering.
+AI Code Agent — Phase 2: Context Selector
+Selects the most relevant files for a given task.
+Supports ALL languages — uses keyword heuristic ranking.
 """
 
 from utils.logger import log, separator
-from utils.llm import query_llm_json
 from utils.file_ops import read_file
+
+
+# Language groups for scoring
+_CODE_LANGUAGES = {
+    "python", "javascript", "typescript", "java",
+    "c", "cpp", "ruby", "go", "rust", "bash",
+}
+
+_WEB_LANGUAGES = {"html", "css", "javascript", "typescript"}
 
 
 def select_context(task: str, repo_analysis: dict, max_files: int = 3) -> list:
     """
     Select the most relevant files for a task.
+    Uses keyword-based heuristic ranking. Supports all languages.
 
     Returns list of dicts:
         [{"path": str, "relative": str, "content": str, "reason": str}]
@@ -24,29 +33,24 @@ def select_context(task: str, repo_analysis: dict, max_files: int = 3) -> list:
         log("ERROR", "No files in repo analysis")
         return []
 
-    # Stage 1: Heuristic pre-filter (keyword matching)
+    # Rank by heuristic score
     scored = _heuristic_rank(task, files)
-
-    # For small repos (≤10 files), heuristic ranking is sufficient
-    # LLM ranking is only used for large repos where selection matters more
-    if len(scored) <= max_files or len(files) <= 10:
-        selected = scored[:max_files]
-    else:
-        # Stage 2: LLM-based ranking for top candidates
-        candidates = scored[:min(len(scored), max_files * 3)]
-        selected = _llm_rank(task, candidates, max_files)
+    selected = scored[:max_files]
 
     # Load content for selected files
     result = []
-    for item in selected[:max_files]:
+    for item in selected:
         content = read_file(item["path"])
-        result.append({
-            "path": item["path"],
-            "relative": item["relative"],
-            "content": content,
-            "reason": item.get("reason", "relevant file"),
-        })
-        log("CONTEXT", f"Selected: {item['relative']} — {item.get('reason', 'relevant')}")
+        if content:
+            reason = f"score={item['_score']}, {item['language']}"
+            log("CONTEXT", f"Selected: {item['relative']} ({reason})")
+            result.append({
+                "path": item["path"],
+                "relative": item["relative"],
+                "content": content,
+                "language": item["language"],
+                "reason": reason,
+            })
 
     return result
 
@@ -54,6 +58,7 @@ def select_context(task: str, repo_analysis: dict, max_files: int = 3) -> list:
 def _heuristic_rank(task: str, files: list) -> list:
     """
     Fast keyword-based ranking of files against the task.
+    Prefers: filename match > function match > language match > smaller files.
     """
     task_lower = task.lower()
     task_words = set(task_lower.split())
@@ -62,76 +67,65 @@ def _heuristic_rank(task: str, files: list) -> list:
     for f in files:
         score = 0
         rel = f["relative"].lower()
-        lang = f["language"]
+        lang = f.get("language", "unknown")
 
-        # Filename keyword match
+        # Filename keyword match (strongest signal)
         for word in task_words:
-            if word in rel:
+            if len(word) > 2 and word in rel:
                 score += 10
 
-        # Language relevance
+        # Language name match in task
         if lang in task_lower:
-            score += 5
+            score += 7
 
-        # Prefer code files over docs
-        if lang in ("python", "javascript", "java", "c", "cpp", "html", "css"):
-            score += 3
+        # Web keywords → prefer web files
+        web_words = {"html", "css", "web", "page", "style", "website", "frontend", "ui"}
+        if web_words & task_words and lang in _WEB_LANGUAGES:
+            score += 6
 
-        # Prefer smaller files (more focused)
-        if f["size"] < 5000:
-            score += 2
-
-        # Function name matching
+        # Function name matching (Python only — others don't have AST data)
         for func in f.get("functions", []):
             for word in task_words:
-                if word in func["name"].lower():
+                if len(word) > 2 and word in func["name"].lower():
                     score += 8
+
+        # Class name matching
+        for cls in f.get("classes", []):
+            for word in task_words:
+                if len(word) > 2 and word in cls["name"].lower():
+                    score += 6
+
+        # Prefer code files over docs
+        if lang in _CODE_LANGUAGES or lang in _WEB_LANGUAGES:
+            score += 2
+
+        # Prefer smaller files (more focused, easier for LLM)
+        if f["size"] < 2000:
+            score += 4
+        elif f["size"] < 5000:
+            score += 2
+
+        # Slight boost for files with functions
+        if f.get("functions"):
+            score += 1
 
         scored.append({**f, "_score": score})
 
-    scored.sort(key=lambda x: x["_score"], reverse=True)
+    scored.sort(key=lambda x: (-x["_score"], x["size"]))
     return scored
 
 
-def _llm_rank(task: str, candidates: list, max_files: int) -> list:
-    """
-    Use LLM to rank candidate files by relevance to the task.
-    """
-    file_list = "\n".join(
-        f"  {i+1}. {c['relative']} ({c['language']}, {c['size']}B)"
-        + (f" — functions: {', '.join(fn['name'] for fn in c.get('functions', [])[:5])}" if c.get("functions") else "")
-        for i, c in enumerate(candidates)
-    )
-
-    prompt = f"""Given this task: "{task}"
-
-Which of these files are most relevant? Pick up to {max_files}.
-
-Files:
-{file_list}
-
-Return JSON: {{"selections": [{{"index": 1, "reason": "..."}}]}}"""
-
-    result = query_llm_json(prompt)
-    selections = result.get("selections", [])
-
-    if not selections:
-        # Fallback to heuristic top-N
-        return candidates[:max_files]
-
-    ranked = []
-    for sel in selections:
-        idx = sel.get("index", 0) - 1
-        if 0 <= idx < len(candidates):
-            candidates[idx]["reason"] = sel.get("reason", "LLM selected")
-            ranked.append(candidates[idx])
-
-    return ranked if ranked else candidates[:max_files]
-
-
 def build_context_prompt(context_files: list) -> str:
-    """Build a context string from selected files for LLM prompts."""
+    """Build a compact context string from selected files for LLM prompts."""
+    lang_fence = {
+        "python": "python", "javascript": "javascript", "java": "java",
+        "c": "c", "cpp": "cpp", "html": "html", "css": "css",
+        "typescript": "typescript", "ruby": "ruby", "bash": "bash",
+    }
+
     parts = []
     for cf in context_files:
-        parts.append(f"### {cf['relative']}\n```\n{cf['content']}\n```")
+        lang = cf.get("language", "")
+        fence = lang_fence.get(lang, "")
+        parts.append(f"### {cf['relative']}\n```{fence}\n{cf['content']}\n```")
     return "\n\n".join(parts)

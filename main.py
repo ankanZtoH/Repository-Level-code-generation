@@ -3,17 +3,13 @@
 AI Code Agent — Main Entry Point
 ================================
 
-A research-inspired autonomous coding agent combining ideas from:
-  • SWE-agent   — THINK → ACT → OBSERVE → REFLECT loop
-  • OpenDevin   — Autonomous task planning & execution
-  • OpenHands   — Structured tool-based interaction
-  • Aider       — Context-aware code editing with diffs
+A controlled semi-autonomous coding agent for Python files.
 
 Usage:
     python main.py                          # Interactive menu
-    python main.py phase1 <file> <instr>    # Direct Phase 1 edit
+    python main.py phase1 <file> <instr>    # Direct Phase 1 edit (Python only)
     python main.py phase2 <repo> <task>     # Phase 2 agent
-    python main.py demo                     # Run all demos
+    python main.py demo                     # Run demo
 """
 
 import sys
@@ -30,25 +26,7 @@ from phase1.editor import edit_file, edit_code
 from phase2.agent import run_agent
 
 
-# ─── Demo Scenarios ─────────────────────────────────────────
-
-def demo_phase1_css():
-    """Demo: Phase 1 — Improve CSS styling."""
-    banner("DEMO: Phase 1 — CSS Improvement")
-    css_path = os.path.join(DEMO_REPO_DIR, "style.css")
-
-    if not os.path.isfile(css_path):
-        log("ERROR", f"Demo file not found: {css_path}")
-        return False
-
-    instruction = (
-        "Modernize this CSS with: dark background (#1a1a2e), accent color (#e94560), "
-        "smooth transitions on hover, rounded corners on cards, a gradient header, "
-        "box shadows, and better spacing. Make it look professional and modern."
-    )
-
-    return edit_file(instruction, css_path)
-
+# ─── Demo Scenarios (Python only) ──────────────────────────
 
 def demo_phase1_python():
     """Demo: Phase 1 — Direct Python code edit."""
@@ -92,31 +70,6 @@ def demo_phase2_bugfix():
     return result["success"]
 
 
-def demo_phase2_generate():
-    """Demo: Phase 2 — Generate a Flask app from scratch."""
-    banner("DEMO: Phase 2 — Generate Flask App")
-
-    # Create a subdirectory for the generated project
-    gen_dir = os.path.join(DEMO_REPO_DIR, "flask_app")
-    os.makedirs(gen_dir, exist_ok=True)
-
-    task = (
-        "Create a simple Flask web application with:\n"
-        "1. A main app.py file with routes for '/' (home) and '/api/hello/<name>'\n"
-        "2. The home route should return a simple HTML page with a greeting form\n"
-        "3. The API route should return JSON with a greeting message\n"
-        "4. Include proper error handling and a requirements.txt\n"
-        "Do NOT run the Flask app (it would block), just create the files."
-    )
-
-    result = run_agent(task, gen_dir)
-    separator("Agent Result")
-    log("RESULT", f"Success: {result['success']}")
-    log("RESULT", f"Steps: {result['steps']}")
-    log("RESULT", f"Summary: {result['summary']}")
-    return result["success"]
-
-
 def demo_phase2_feature():
     """Demo: Phase 2 — Add missing features to string_utils.py."""
     banner("DEMO: Phase 2 — Add Features")
@@ -141,19 +94,17 @@ def demo_phase2_feature():
 def interactive_menu():
     """Display interactive menu for demo selection."""
     banner("AI CODE AGENT")
-    print("  Research-inspired autonomous coding agent")
+    print("  Controlled semi-autonomous agent for Python code")
     print(f"  Model: {OLLAMA_MODEL}")
     print()
 
     options = {
-        "1": ("Phase 1: Improve CSS styling",       demo_phase1_css),
-        "2": ("Phase 1: Edit Python code",           demo_phase1_python),
-        "3": ("Phase 2: Fix calculator bug",         demo_phase2_bugfix),
-        "4": ("Phase 2: Generate Flask app",         demo_phase2_generate),
-        "5": ("Phase 2: Add features to string_utils", demo_phase2_feature),
-        "6": ("Run ALL demos",                       None),
-        "7": ("Custom Phase 1 (provide file + instruction)", None),
-        "8": ("Custom Phase 2 (provide repo + task)", None),
+        "1": ("Phase 1: Edit Python code",            demo_phase1_python),
+        "2": ("Phase 2: Fix calculator bug",           demo_phase2_bugfix),
+        "3": ("Phase 2: Add features to string_utils", demo_phase2_feature),
+        "4": ("Run ALL demos",                         None),
+        "5": ("Custom Phase 1 (provide .py file + instruction)", None),
+        "6": ("Custom Phase 2 (provide repo + task)",  None),
     }
 
     for key, (desc, _) in options.items():
@@ -166,11 +117,11 @@ def interactive_menu():
     if choice == "q":
         print("Goodbye!")
         sys.exit(0)
-    elif choice == "6":
+    elif choice == "4":
         run_all_demos()
-    elif choice == "7":
+    elif choice == "5":
         custom_phase1()
-    elif choice == "8":
+    elif choice == "6":
         custom_phase2()
     elif choice in options and options[choice][1]:
         options[choice][1]()
@@ -183,10 +134,8 @@ def run_all_demos():
     """Run all demo scenarios."""
     banner("RUNNING ALL DEMOS")
     demos = [
-        ("Phase 1: CSS",              demo_phase1_css),
         ("Phase 1: Python",           demo_phase1_python),
         ("Phase 2: Bug Fix",          demo_phase2_bugfix),
-        ("Phase 2: Flask Generation", demo_phase2_generate),
         ("Phase 2: Add Features",     demo_phase2_feature),
     ]
 
@@ -203,18 +152,22 @@ def run_all_demos():
     # Summary
     banner("DEMO RESULTS")
     for name, success in results:
-        status = "✅ PASS" if success else "❌ FAIL"
-        print(f"  {status}  {name}")
+        status = "PASS" if success else "FAIL"
+        print(f"  [{status}]  {name}")
     print()
 
 
 def custom_phase1():
-    """Custom Phase 1: User provides file and instruction."""
-    filepath = input("File path: ").strip()
+    """Custom Phase 1: User provides Python file and instruction."""
+    filepath = input("Python file path (.py): ").strip()
     instruction = input("Edit instruction: ").strip()
 
     if not filepath or not instruction:
         log("ERROR", "Both file path and instruction are required")
+        return
+
+    if not filepath.endswith(".py"):
+        log("ERROR", "Only Python (.py) files are supported")
         return
 
     edit_file(instruction, filepath)
@@ -264,6 +217,9 @@ def main():
 
     elif command == "phase1" and len(args) >= 3:
         filepath = args[1]
+        if not filepath.endswith(".py"):
+            print("ERROR: Only Python (.py) files are supported")
+            sys.exit(1)
         instruction = " ".join(args[2:])
         edit_file(instruction, filepath)
 

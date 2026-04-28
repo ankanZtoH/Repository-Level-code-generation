@@ -1,6 +1,8 @@
 """
 AI Code Agent — Code Executor
 Runs code files in subprocess with output/error capture.
+Supports: Python, C, C++, Java, JavaScript, Ruby, Shell.
+Non-runnable files (HTML, CSS) are not handled here.
 """
 
 import subprocess
@@ -12,18 +14,28 @@ from utils.logger import log
 RUNNERS = {
     ".py":   ["python3"],
     ".js":   ["node"],
-    ".java": None,          # Handled specially (compile + run)
-    ".c":    None,          # Handled specially (compile + run)
-    ".cpp":  None,          # Handled specially (compile + run)
     ".rb":   ["ruby"],
     ".sh":   ["bash"],
 }
+
+# Languages that need compile-then-run
+COMPILED_LANGUAGES = {".c", ".cpp", ".java"}
+
+# Languages that can't be executed (just written)
+NON_EXECUTABLE = {".html", ".css", ".scss", ".less", ".md", ".txt", ".json", ".xml", ".yaml", ".yml"}
+
+
+def can_execute(filepath: str) -> bool:
+    """Check if a file type can be executed."""
+    ext = os.path.splitext(filepath)[1].lower()
+    return ext in RUNNERS or ext in COMPILED_LANGUAGES
 
 
 def run_code(filepath: str, timeout: int = 30) -> dict:
     """
     Execute a code file and return stdout, stderr, and return code.
-    Supports Python, JS, Java, C, C++, Ruby, Shell.
+    Supports Python, JS, C, C++, Java, Ruby, Shell.
+    Returns error for non-executable files (HTML, CSS).
     """
     abs_path = os.path.abspath(filepath)
     if not os.path.isfile(abs_path):
@@ -34,6 +46,13 @@ def run_code(filepath: str, timeout: int = 30) -> dict:
     basename = os.path.basename(abs_path)
     name_no_ext = os.path.splitext(basename)[0]
 
+    if ext in NON_EXECUTABLE:
+        return {
+            "stdout": f"{basename} is a {ext} file — no execution needed. File written successfully.",
+            "stderr": "",
+            "returncode": 0,
+        }
+
     log("TOOL", f"Running {basename} ...")
 
     try:
@@ -41,7 +60,7 @@ def run_code(filepath: str, timeout: int = 30) -> dict:
             return _compile_and_run_c(abs_path, cwd, ext, timeout)
         elif ext == ".java":
             return _compile_and_run_java(abs_path, cwd, name_no_ext, timeout)
-        elif ext in RUNNERS and RUNNERS[ext]:
+        elif ext in RUNNERS:
             cmd = RUNNERS[ext] + [abs_path]
             return _execute(cmd, cwd, timeout)
         else:
@@ -72,7 +91,6 @@ def _compile_and_run_c(filepath: str, cwd: str, ext: str, timeout: int) -> dict:
     out_bin = os.path.join(cwd, "a.out")
     compiler = "gcc" if ext == ".c" else "g++"
 
-    # Compile
     compile_result = subprocess.run(
         [compiler, filepath, "-o", out_bin],
         capture_output=True, text=True, cwd=cwd, timeout=timeout
@@ -84,10 +102,8 @@ def _compile_and_run_c(filepath: str, cwd: str, ext: str, timeout: int) -> dict:
             "returncode": compile_result.returncode,
         }
 
-    # Run
     result = _execute([out_bin], cwd, timeout)
 
-    # Cleanup
     try:
         os.remove(out_bin)
     except OSError:
@@ -98,7 +114,6 @@ def _compile_and_run_c(filepath: str, cwd: str, ext: str, timeout: int) -> dict:
 
 def _compile_and_run_java(filepath: str, cwd: str, classname: str, timeout: int) -> dict:
     """Compile and run Java files."""
-    # Compile
     compile_result = subprocess.run(
         ["javac", filepath],
         capture_output=True, text=True, cwd=cwd, timeout=timeout
@@ -110,10 +125,8 @@ def _compile_and_run_java(filepath: str, cwd: str, classname: str, timeout: int)
             "returncode": compile_result.returncode,
         }
 
-    # Run
     result = _execute(["java", "-cp", cwd, classname], cwd, timeout)
 
-    # Cleanup .class
     class_file = os.path.join(cwd, classname + ".class")
     try:
         os.remove(class_file)

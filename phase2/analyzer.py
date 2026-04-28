@@ -1,7 +1,8 @@
 """
 AI Code Agent — Phase 2: Repo Analyzer
-Analyzes repository structure, extracts functions via AST, and builds a codebase map.
-Inspired by Aider's repo-map approach.
+Analyzes repository structure for ALL supported languages.
+Extracts functions/classes via AST for Python files.
+Other languages get basic file info (size, extension).
 """
 
 import os
@@ -10,24 +11,27 @@ from utils.logger import log, separator
 from utils.file_ops import list_files, read_file
 
 
+# Supported code file extensions
+SUPPORTED_EXTENSIONS = [
+    ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".c", ".cpp", ".h", ".hpp",
+    ".java",
+    ".html", ".css", ".scss",
+    ".rb", ".go", ".rs", ".sh",
+]
+
+
+# ─── Public API ─────────────────────────────────────────────
+
 def analyze_repo(repo_path: str) -> dict:
     """
     Analyze a repository and return a structured map.
+    Includes ALL supported code file types.
 
     Returns:
         {
             "path": str,
-            "files": [
-                {
-                    "path": str,
-                    "relative": str,
-                    "language": str,
-                    "size": int,
-                    "functions": [{"name": str, "lineno": int, "end_lineno": int, "args": [str]}],
-                    "classes": [{"name": str, "lineno": int, "methods": [str]}],
-                    "imports": [str],
-                }
-            ],
+            "files": [FileInfo],
             "summary": str,
         }
     """
@@ -35,7 +39,7 @@ def analyze_repo(repo_path: str) -> dict:
     abs_path = os.path.abspath(repo_path)
     log("INFO", f"Analyzing repository: {abs_path}")
 
-    all_files = list_files(abs_path)
+    all_files = list_files(abs_path, extensions=SUPPORTED_EXTENSIONS)
     file_infos = []
 
     for fpath in all_files:
@@ -63,11 +67,48 @@ def analyze_repo(repo_path: str) -> dict:
     }
 
 
+def get_repo_map_text(analysis: dict) -> str:
+    """Generate a compact repo map string for LLM context."""
+    lines = [f"Repository: {analysis['path']}", f"Summary: {analysis['summary']}", ""]
+
+    for f in analysis["files"]:
+        lines.append(f"{f['relative']}  ({f['language']}, {f['size']}B)")
+
+        if f.get("functions"):
+            for func in f["functions"]:
+                args_str = ", ".join(func["args"][:4])
+                lines.append(f"   def {func['name']}({args_str})  L{func['lineno']}")
+
+        if f.get("classes"):
+            for cls in f["classes"]:
+                methods_str = ", ".join(cls["methods"][:5])
+                lines.append(f"   class {cls['name']} [{methods_str}]")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ─── File Analysis ───────────────────────────────────────────
+
+LANGUAGE_MAP = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".jsx": "javascript", ".tsx": "typescript",
+    ".java": "java", ".c": "c", ".cpp": "cpp", ".h": "c", ".hpp": "cpp",
+    ".html": "html", ".css": "css", ".scss": "css",
+    ".rb": "ruby", ".go": "go", ".rs": "rust", ".sh": "bash",
+}
+
+
 def _analyze_file(filepath: str, repo_root: str) -> dict:
-    """Analyze a single file."""
+    """Analyze a single file. Returns None on error."""
     try:
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in LANGUAGE_MAP:
+            return None
+
         relative = os.path.relpath(filepath, repo_root)
-        language = _detect_language(filepath)
+        language = LANGUAGE_MAP[ext]
         size = os.path.getsize(filepath)
 
         info = {
@@ -80,7 +121,7 @@ def _analyze_file(filepath: str, repo_root: str) -> dict:
             "imports": [],
         }
 
-        # Deep analysis only for Python files (AST)
+        # Deep AST analysis only for Python
         if language == "python":
             _analyze_python(filepath, info)
 
@@ -90,88 +131,45 @@ def _analyze_file(filepath: str, repo_root: str) -> dict:
 
 
 def _analyze_python(filepath: str, info: dict):
-    """Extract functions, classes, and imports from Python files using AST."""
+    """Extract functions, classes, and imports from a Python file using AST."""
+    source = read_file(filepath)
+    if not source:
+        return
+
     try:
-        source = read_file(filepath)
-        if not source:
-            return
-
         tree = ast.parse(source, filename=filepath)
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
-                func_info = {
-                    "name": node.name,
-                    "lineno": node.lineno,
-                    "end_lineno": getattr(node, "end_lineno", node.lineno),
-                    "args": [arg.arg for arg in node.args.args],
-                }
-                info["functions"].append(func_info)
-
-            elif isinstance(node, ast.ClassDef):
-                methods = [
-                    n.name for n in node.body
-                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                ]
-                class_info = {
-                    "name": node.name,
-                    "lineno": node.lineno,
-                    "methods": methods,
-                }
-                info["classes"].append(class_info)
-
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    info["imports"].append(alias.name)
-
-            elif isinstance(node, ast.ImportFrom):
-                module = node.module or ""
-                for alias in node.names:
-                    info["imports"].append(f"{module}.{alias.name}")
-
     except SyntaxError:
         log("INFO", f"Skipping AST parse for {filepath} (syntax error)")
+        return
     except Exception as e:
         log("INFO", f"AST analysis failed for {filepath}: {e}")
+        return
 
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            info["functions"].append({
+                "name": node.name,
+                "lineno": node.lineno,
+                "end_lineno": getattr(node, "end_lineno", node.lineno),
+                "args": [arg.arg for arg in node.args.args],
+            })
 
-def get_repo_map_text(analysis: dict) -> str:
-    """Generate a human-readable repo map string for LLM context."""
-    lines = [f"Repository: {analysis['path']}", f"Summary: {analysis['summary']}", ""]
+        elif isinstance(node, ast.ClassDef):
+            methods = [
+                n.name for n in node.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            info["classes"].append({
+                "name": node.name,
+                "lineno": node.lineno,
+                "methods": methods,
+            })
 
-    for f in analysis["files"]:
-        lines.append(f"📄 {f['relative']}  ({f['language']}, {f['size']}B)")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                info["imports"].append(alias.name)
 
-        if f["classes"]:
-            for cls in f["classes"]:
-                methods_str = ", ".join(cls["methods"][:5])
-                lines.append(f"   class {cls['name']} [{methods_str}]")
-
-        if f["functions"]:
-            for func in f["functions"]:
-                args_str = ", ".join(func["args"][:4])
-                lines.append(f"   def {func['name']}({args_str})  L{func['lineno']}")
-
-        if f["imports"]:
-            imports_str = ", ".join(f["imports"][:5])
-            if len(f["imports"]) > 5:
-                imports_str += f" (+{len(f['imports'])-5} more)"
-            lines.append(f"   imports: {imports_str}")
-
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def _detect_language(filepath: str) -> str:
-    """Detect language from file extension."""
-    ext_map = {
-        ".py": "python", ".js": "javascript", ".ts": "typescript",
-        ".java": "java", ".c": "c", ".cpp": "cpp", ".h": "c",
-        ".html": "html", ".css": "css", ".rb": "ruby",
-        ".go": "go", ".rs": "rust", ".sh": "bash",
-        ".json": "json", ".xml": "xml", ".yaml": "yaml", ".yml": "yaml",
-        ".md": "markdown", ".txt": "text",
-    }
-    ext = os.path.splitext(filepath)[1].lower()
-    return ext_map.get(ext, "unknown")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                info["imports"].append(f"{module}.{alias.name}")

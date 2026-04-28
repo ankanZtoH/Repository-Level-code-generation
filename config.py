@@ -11,7 +11,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "codellama")  # or "mistral"
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
 # ─── Agent Settings ─────────────────────────────────────────
-MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "10"))
+MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "15"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 # ─── Logging ────────────────────────────────────────────────
