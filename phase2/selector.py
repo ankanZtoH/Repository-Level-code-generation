@@ -78,6 +78,11 @@ def _heuristic_rank(task: str, files: list) -> list:
         if lang in task_lower:
             score += 7
 
+        # Syntax error boosting (highest priority)
+        if f.get("has_syntax_error"):
+            score += 50
+            log("CONTEXT", f"Boosting {f['relative']} due to detected syntax error")
+
         # Web keywords → prefer web files
         web_words = {"html", "css", "web", "page", "style", "website", "frontend", "ui"}
         if web_words & task_words and lang in _WEB_LANGUAGES:

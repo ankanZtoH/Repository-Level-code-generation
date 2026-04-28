@@ -202,8 +202,7 @@ def _extract_target_file(task: str, context: list) -> tuple:
         (filename, error_message)
         - If a supported file is found: ("calculator.py", "")
         - If an unsupported file is found: ("", "file.swift is not supported...")
-        - If no file found, fall back to context: ("calculator.py", "")
-        - If nothing found: ("", "Could not determine target file")
+        - If no file found: ("", "")  <-- Proceed to context
     """
     words = task.split()
     for word in words:
@@ -219,10 +218,12 @@ def _extract_target_file(task: str, context: list) -> tuple:
             if cleaned.lower().endswith(ext):
                 return ("", f"{cleaned} is not supported. Supported: .py, .js, .c, .cpp, .java, .html, .css")
 
+    # No explicit file mentioned in task — check context
     if context:
         return (context[0].get("relative", ""), "")
 
-    return ("", "Could not determine target file from task.")
+    # No file found at all — return empty but NO error yet
+    return ("", "")
 
 
 # ─── Loop Protection ────────────────────────────────────────
@@ -451,7 +452,13 @@ def _execute_create_workflow(task: str, repo_path: str) -> dict:
 
     print(f"  Created {target_file}")
 
-    # Step 3: Run the code to verify
+    # Step 3: Run the code to verify (if executable)
+    if not can_execute(target_file):
+        summary = response.get("thought", f"Created {target_file}")
+        print(f"  Note: {target_file} is not executable (e.g. HTML/CSS). Skipping run step.")
+        print(f"\nDONE: {summary}")
+        return {"success": True, "summary": summary, "steps": step_count}
+
     step_count += 1
     print(f"STEP {step_count}: run_code {target_file}")
 
@@ -541,12 +548,13 @@ def _execute_create_workflow(task: str, repo_path: str) -> dict:
 
 def _execute_fix_workflow(task: str, target_file: str, context: list, repo_path: str) -> dict:
     """
-    Fix an existing Python file:
+    Fix an existing file:
       1. read_file
-      2. LLM generates fix -> write_file
-      3. run_code
-      4. if error -> retry fix (max MAX_RETRIES times)
-      5. if success -> DONE
+      2. run_code (to get error/traceback)
+      3. LLM generates fix (using error) -> write_file
+      4. run_code (verify)
+      5. if error -> retry fix (max MAX_RETRIES times)
+      6. if success -> DONE
     """
     loop_guard = LoopProtector(max_repeats=MAX_RETRIES)
     step_count = 0
@@ -584,7 +592,19 @@ def _execute_fix_workflow(task: str, target_file: str, context: list, repo_path:
         if newline_idx != -1:
             file_content = observation[newline_idx + 1:]
 
-    # ── Step 2: Ask LLM to generate the fix ──
+    # ── Step 2: Run the code to get an initial error ──
+    if can_execute(target_file):
+        step_count += 1
+        print(f"STEP {step_count}: run_code {target_file} (initial check)")
+        run_result = execute_tool({"tool": "run_code", "path": target_file}, repo_path)
+        
+        if "Return code: 0" not in run_result:
+            last_error = run_result
+            print(f"  Detected error: {analyze_error(run_result).get('type', 'Error')}")
+        else:
+            print("  Initial run succeeded (no errors detected yet)")
+
+    # ── Step 3: Ask LLM to generate the fix ──
     step_count += 1
     print(f"STEP {step_count}: write_file {target_file}")
 
@@ -604,6 +624,23 @@ def _execute_fix_workflow(task: str, target_file: str, context: list, repo_path:
         print("ERROR: LLM did not provide file content")
         return {"success": False, "summary": "LLM did not provide file content", "steps": step_count}
 
+    # ── Safety Check: Deletion Protection ──
+    # If the new content is much shorter than the original (e.g. < 60% of original)
+    # and the task wasn't explicitly to delete code, it's likely a lazy LLM.
+    if len(file_content) > 100 and len(new_content) < (len(file_content) * 0.6):
+        msg = "Refusing to write: New content is significantly shorter than original. LLM likely omitted parts of the file."
+        print(f"  [WARNING] Deletion detected ({len(new_content)} vs {len(file_content)} chars)")
+        
+        # Force a retry with a specific warning
+        step_count += 1
+        print(f"STEP {step_count}: write_file {target_file} (RETRY - No Deletions Allowed)")
+        warning_prompt = f"{fix_prompt}\n\nCRITICAL ERROR: Your previous response deleted most of the file. You MUST provide the ENTIRE file content in the 'content' field, including all existing functions. Do NOT omit anything."
+        response = query_llm_json(warning_prompt, system_prompt=AGENT_SYSTEM_PROMPT)
+        new_content = response.get("content", "") if response else ""
+        
+        if not new_content or len(new_content) < (len(file_content) * 0.6):
+            return {"success": False, "summary": "LLM repeatedly deleted file content", "steps": step_count}
+
     write_action = {"tool": "write_file", "path": target_file, "content": new_content}
     write_result = execute_tool(write_action, repo_path)
 
@@ -611,18 +648,26 @@ def _execute_fix_workflow(task: str, target_file: str, context: list, repo_path:
         print(f"  {write_result}")
         return {"success": False, "summary": f"Failed to write {target_file}", "steps": step_count}
 
-    # ── Step 3: Run the code to verify ──
-    step_count += 1
-    print(f"STEP {step_count}: run_code {target_file}")
+    # ── Step 4: Run the code to verify ──
+    if can_execute(target_file):
+        step_count += 1
+        print(f"STEP {step_count}: run_code {target_file} (verify)")
 
-    run_action = {"tool": "run_code", "path": target_file}
-    run_result = execute_tool(run_action, repo_path)
+        run_action = {"tool": "run_code", "path": target_file}
+        run_result = execute_tool(run_action, repo_path)
 
-    print(f"  {run_result[:300]}")
+        print(f"  {run_result[:300]}")
 
-    if "Return code: 0" in run_result:
-        summary = response.get("thought", response.get("summary", "Fixed the code"))
-        print(f"\nReturn code: 0")
+        if "Return code: 0" in run_result:
+            summary = response.get("thought", response.get("summary", "Fixed the code"))
+            print(f"\nReturn code: 0")
+            print(f"\nDONE: {summary}")
+            return {"success": True, "summary": summary, "steps": step_count}
+        
+        last_error = run_result
+    else:
+        # Non-executable success
+        summary = response.get("thought", "Updated file")
         print(f"\nDONE: {summary}")
         return {"success": True, "summary": summary, "steps": step_count}
 

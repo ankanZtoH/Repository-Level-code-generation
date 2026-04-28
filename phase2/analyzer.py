@@ -74,6 +74,9 @@ def get_repo_map_text(analysis: dict) -> str:
     for f in analysis["files"]:
         lines.append(f"{f['relative']}  ({f['language']}, {f['size']}B)")
 
+        if f.get("has_syntax_error"):
+            lines.append("   !!! SYNTAX ERROR DETECTED !!!")
+
         if f.get("functions"):
             for func in f["functions"]:
                 args_str = ", ".join(func["args"][:4])
@@ -119,31 +122,32 @@ def _analyze_file(filepath: str, repo_root: str) -> dict:
             "functions": [],
             "classes": [],
             "imports": [],
+            "has_syntax_error": False,
         }
 
         # Deep AST analysis only for Python
         if language == "python":
-            _analyze_python(filepath, info)
+            info["has_syntax_error"] = not _analyze_python(filepath, info)
 
         return info
     except Exception:
         return None
 
 
-def _analyze_python(filepath: str, info: dict):
-    """Extract functions, classes, and imports from a Python file using AST."""
+def _analyze_python(filepath: str, info: dict) -> bool:
+    """Extract functions, classes, and imports. Returns False on syntax error."""
     source = read_file(filepath)
     if not source:
-        return
+        return True
 
     try:
         tree = ast.parse(source, filename=filepath)
     except SyntaxError:
         log("INFO", f"Skipping AST parse for {filepath} (syntax error)")
-        return
+        return False
     except Exception as e:
         log("INFO", f"AST analysis failed for {filepath}: {e}")
-        return
+        return True
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -173,3 +177,5 @@ def _analyze_python(filepath: str, info: dict):
             module = node.module or ""
             for alias in node.names:
                 info["imports"].append(f"{module}.{alias.name}")
+    
+    return True
