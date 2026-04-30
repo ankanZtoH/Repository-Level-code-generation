@@ -863,9 +863,11 @@ from utils.llm import query_llm_json
 from utils.file_ops import read_file
 from utils.executor import can_execute
 from utils.error_handler import analyze_error
-from phase2.analyzer import analyze_repo, extract_dependency_graph
+from phase2.analyzer import analyze_repo, extract_dependency_graph, get_repo_map_text
+from phase2.planner import create_plan
 from phase2.selector import select_context
 from phase2.tools import execute_tool
+from phase2.retrieval import index_repo, query_relevant_code
 
 
 # ─── Constants ──────────────────────────────────────────────
@@ -902,14 +904,14 @@ _CREATE_KEYWORDS = {
 
 # ─── System Prompts ─────────────────────────────────────────
 
-AGENT_SYSTEM_PROMPT = """You are a coding agent that fixes bugs in Python files.
+AGENT_SYSTEM_PROMPT = """You are a coding agent that fixes bugs in code files.
 
 RULES:
-- The "content" field MUST contain the actual Python source code of the fixed file.
+- The "content" field MUST contain the actual source code of the fixed file.
 - Write the COMPLETE file — every function, every line, nothing omitted.
 - "path" must be the exact relative filename (e.g. "calculator.py").
-- NEVER use input() or scanf(). Use hardcoded test values only.
-- Do NOT use relative imports. Use absolute imports.
+- NEVER use input(), scanf(), or prompt(). Use hardcoded test values only.
+- For Python, do NOT use relative imports. Use absolute imports.
 - If the file has no bug, set done=true with no content.
 
 Respond with ONLY valid JSON.
@@ -970,16 +972,18 @@ def _retry_for_real_content(file_name: str, file_content: str) -> str:
     """
     Hard retry when the LLM returned a placeholder.
     Sends a stripped-down direct prompt showing the current file
-    and demands actual Python code, no examples.
+    and demands actual source code, no examples.
     Returns the fixed content string, or '' if still unusable.
     """
+    language = _language_for_path(file_name)
+    fence = _fence_for_path(file_name)
     retry_prompt = (
         f"Fix all bugs in the file '{file_name}' shown below.\n\n"
-        f"```python\n{file_content}\n```\n\n"
-        f"Reply ONLY with this JSON (replace content with real Python code):\n"
+        f"```{fence}\n{file_content}\n```\n\n"
+        f"Reply ONLY with this JSON (replace content with real {language} source code):\n"
         f'{{\"thought\": \"...\", \"tool\": \"write_file\", \"path\": \"{file_name}\", '
-        f'\"content\": \"<actual python code>\", \"done\": false}}\n\n'
-        f"The content field must contain real, runnable Python source code."
+        f'\"content\": \"<actual source code>\", \"done\": false}}\n\n'
+        f"The content field must contain real, runnable {language} source code."
     )
     resp = query_llm_json(retry_prompt, system_prompt=AGENT_SYSTEM_PROMPT)
     if resp and resp.get("content") and not _is_placeholder(resp["content"]):
@@ -1029,10 +1033,23 @@ def _run_fix(task: str, repo_path: str) -> dict:
     dep_graph = extract_dependency_graph(repo_path, file_infos)
     print(f"Dependency graph: {dep_graph}")
 
+    # Build a task plan from the repo map. The loop still reacts to runtime
+    # observations, but this gives each LLM edit step a stable objective.
+    repo_map = get_repo_map_text(repo_analysis)
+    plan = create_plan(task, repo_map)
+    plan_context = _format_plan_context(plan)
+
+    # Build semantic index (graceful if sentence-transformers missing)
+    n_indexed = index_repo(repo_analysis)
+    if n_indexed:
+        print(f"Semantic index: {n_indexed} chunks indexed")
+    else:
+        print("Semantic index: disabled (no model or no chunks)")
+
     # Broad task: fix all files
     if _is_broad_task(task):
         print("Broad task — exploring all Python files")
-        return _run_fix_all(task, file_infos, dep_graph, repo_path)
+        return _run_fix_all(task, file_infos, dep_graph, repo_path, plan_context)
 
     # Targeted task: find the specific entry point
     entry_point, err = _find_entry_point(task, repo_path, file_infos, repo_analysis)
@@ -1040,10 +1057,16 @@ def _run_fix(task: str, repo_path: str) -> dict:
         return {"success": False, "summary": err, "steps": 0}
 
     print(f"Entry point: {entry_point}")
-    return _run_fix_targeted(task, entry_point, dep_graph, repo_path)
+    return _run_fix_targeted(task, entry_point, dep_graph, repo_path, plan_context)
 
 
-def _run_fix_targeted(task: str, entry_point: str, dep_graph: dict, repo_path: str) -> dict:
+def _run_fix_targeted(
+    task: str,
+    entry_point: str,
+    dep_graph: dict,
+    repo_path: str,
+    plan_context: str = "",
+) -> dict:
     """
     Fix a specific entry point and its dependencies using queue traversal.
     """
@@ -1068,12 +1091,22 @@ def _run_fix_targeted(task: str, entry_point: str, dep_graph: dict, repo_path: s
 
         if "Return code: 0" in run_out:
             if not _is_logic_bug(task, run_out):
-                return {
-                    "success": True,
-                    "summary": f"No fix needed — {entry_point} already runs correctly",
-                    "steps": step,
-                }
-            print("  Return code 0 but output looks wrong — checking for logic bugs")
+                step, test_out = _run_tests_step(step, repo_path)
+                last_run_output = test_out
+                if not _validation_succeeded(test_out):
+                    print("  Entry point runs, but repository tests failed — continuing")
+                    failing = _trace_error_to_file(test_out, repo_path)
+                    if failing and not _is_test_file(failing) and failing not in queue:
+                        queue.insert(0, failing)
+                else:
+                    test_note = " and tests pass" if not _tests_skipped(test_out) else ""
+                    return {
+                        "success": True,
+                        "summary": f"No fix needed — {entry_point} already runs correctly{test_note}",
+                        "steps": step,
+                    }
+            else:
+                print("  Return code 0 but output looks wrong — checking for logic bugs")
         else:
             error_info = analyze_error(run_out)
             print(f"  ERROR: {error_info['type']} — {error_info['message'][:100]}")
@@ -1111,10 +1144,21 @@ def _run_fix_targeted(task: str, entry_point: str, dep_graph: dict, repo_path: s
             if c:
                 related[dep] = c
 
+        # Semantic retrieval: find relevant code not in dep graph
+        semantic_ctx = _get_semantic_context(task, current, last_run_output)
+
         # Ask LLM to fix
         step += 1
         print(f"STEP {step}: LLM fix {current}")
-        prompt = _build_fix_prompt(task, current, file_content, last_run_output, related)
+        prompt = _build_fix_prompt(
+            task,
+            current,
+            file_content,
+            last_run_output,
+            related,
+            semantic_ctx,
+            plan_context,
+        )
         response = query_llm_json(prompt, system_prompt=AGENT_SYSTEM_PROMPT)
 
         if not response:
@@ -1167,9 +1211,17 @@ def _run_fix_targeted(task: str, entry_point: str, dep_graph: dict, repo_path: s
 
         # Non-runnable file — skip verification, treat write as success
         if not can_execute(entry_point):
-            summary = f"Fixed {', '.join(files_modified)}"
-            print(f"\nDONE: {summary}")
-            return {"success": True, "summary": summary, "steps": step}
+            step, test_out = _run_tests_step(step, repo_path)
+            last_run_output = test_out
+            if _validation_succeeded(test_out):
+                summary = f"Fixed {', '.join(files_modified)}"
+                print(f"\nDONE: {summary}")
+                return {"success": True, "summary": summary, "steps": step}
+            print("  Repository tests failed — continuing exploration")
+            failing = _trace_error_to_file(test_out, repo_path)
+            if failing and not _is_test_file(failing) and failing not in visited and failing not in queue:
+                queue.insert(0, failing)
+            continue
 
         # Re-run entry point to verify
         step += 1
@@ -1180,9 +1232,20 @@ def _run_fix_targeted(task: str, entry_point: str, dep_graph: dict, repo_path: s
 
         if "Return code: 0" in run_out:
             if not _is_logic_bug(task, run_out):
-                summary = f"Fixed {', '.join(files_modified)}"
-                print(f"\nDONE: {summary}")
-                return {"success": True, "summary": summary, "steps": step}
+                step, test_out = _run_tests_step(step, repo_path)
+                last_run_output = test_out
+                if _validation_succeeded(test_out):
+                    summary = f"Fixed {', '.join(files_modified)}"
+                    print(f"\nDONE: {summary}")
+                    return {"success": True, "summary": summary, "steps": step}
+                print("  Repository tests failed — continuing exploration")
+                failing = _trace_error_to_file(test_out, repo_path)
+                if failing and not _is_test_file(failing) and failing not in visited and failing not in queue:
+                    queue.insert(0, failing)
+                for dep in dep_graph.get(current, []):
+                    if dep not in visited and dep not in queue:
+                        queue.append(dep)
+                continue
             print("  Output still looks wrong — continuing exploration")
             for dep in dep_graph.get(current, []):
                 if dep not in visited and dep not in queue:
@@ -1204,9 +1267,11 @@ def _run_fix_targeted(task: str, entry_point: str, dep_graph: dict, repo_path: s
         if can_execute(entry_point):
             run_out = execute_tool({"tool": "run_code", "path": entry_point}, repo_path)
             if "Return code: 0" in run_out and not _is_logic_bug(task, run_out):
-                summary = f"Fixed {', '.join(files_modified)}"
-                print(f"\nDONE: {summary}")
-                return {"success": True, "summary": summary, "steps": step}
+                step, test_out = _run_tests_step(step, repo_path)
+                if _validation_succeeded(test_out):
+                    summary = f"Fixed {', '.join(files_modified)}"
+                    print(f"\nDONE: {summary}")
+                    return {"success": True, "summary": summary, "steps": step}
         summary = f"Modified {', '.join(files_modified)} — may still have issues"
         print(f"\nPARTIAL: {summary}")
         return {"success": False, "summary": summary, "steps": step}
@@ -1215,7 +1280,13 @@ def _run_fix_targeted(task: str, entry_point: str, dep_graph: dict, repo_path: s
     return {"success": False, "summary": "Could not fix any files", "steps": step}
 
 
-def _run_fix_all(task: str, file_infos: list, dep_graph: dict, repo_path: str) -> dict:
+def _run_fix_all(
+    task: str,
+    file_infos: list,
+    dep_graph: dict,
+    repo_path: str,
+    plan_context: str = "",
+) -> dict:
     """
     Broad fix-all mode: EXECUTION-DRIVEN, GRAPH-AWARE debug loop.
 
@@ -1326,10 +1397,21 @@ def _run_fix_all(task: str, file_infos: list, dep_graph: dict, repo_path: str) -
             if c:
                 related[dep] = c
 
+        # Semantic retrieval
+        semantic_ctx = _get_semantic_context(task, current, last_run_output)
+
         # 4b. LLM fix
         step += 1
         print(f"STEP {step}: LLM fix {current}")
-        prompt = _build_fix_prompt(task, current, file_content, last_run_output, related)
+        prompt = _build_fix_prompt(
+            task,
+            current,
+            file_content,
+            last_run_output,
+            related,
+            semantic_ctx,
+            plan_context,
+        )
         response = query_llm_json(prompt, system_prompt=AGENT_SYSTEM_PROMPT)
 
         if not response:
@@ -1392,13 +1474,28 @@ def _run_fix_all(task: str, file_infos: list, dep_graph: dict, repo_path: str) -
         print(f"  {run_out[:300]}")
 
         if "Return code: 0" in run_out:
-            system_runs_clean = True
-            print("  Return code: 0 — continuing to check remaining files for logic/semantic bugs")
-            # Don't stop here — keep exploring the rest of the queue
-            # so we catch naming mismatches (e.g. multiply() doing division)
-            for dep in dep_graph.get(current, []):
-                if dep not in visited and dep not in queue:
-                    queue.append(dep)
+            step, test_out = _run_tests_step(step, repo_path)
+            last_run_output = test_out
+            if _validation_succeeded(test_out):
+                system_runs_clean = True
+                print("  Return code: 0 — continuing to check remaining files for logic/semantic bugs")
+                # Don't stop here — keep exploring the rest of the queue
+                # so we catch naming mismatches (e.g. multiply() doing division)
+                for dep in dep_graph.get(current, []):
+                    if dep not in visited and dep not in queue:
+                        queue.append(dep)
+            else:
+                system_runs_clean = False
+                print("  Repository tests failed — using test output for next iteration")
+                failing = _trace_error_to_file(test_out, repo_path)
+                if failing and not _is_test_file(failing) and failing not in visited:
+                    print(f"  Traced test failure to: {failing}")
+                    if failing in queue:
+                        queue.remove(failing)
+                    queue.insert(0, failing)
+                for dep in dep_graph.get(current, []):
+                    if dep not in visited and dep not in queue:
+                        queue.append(dep)
         else:
             # 4e. Trace new error
             error_info = analyze_error(run_out)
@@ -1420,6 +1517,14 @@ def _run_fix_all(task: str, file_infos: list, dep_graph: dict, repo_path: str) -
     print(f"  {final_out[:300]}")
 
     if "Return code: 0" in final_out:
+        step, test_out = _run_tests_step(step, repo_path)
+        if not _validation_succeeded(test_out):
+            if files_modified:
+                summary = f"Modified {', '.join(files_modified)} — tests still fail"
+                print(f"\nPARTIAL: {summary}")
+                return {"success": False, "summary": summary, "steps": step}
+            print("\nFAILED: Repository tests fail")
+            return {"success": False, "summary": "Repository tests fail", "steps": step}
         if files_modified:
             summary = f"Fixed {', '.join(files_modified)}"
         else:
@@ -1470,8 +1575,15 @@ def _run_create(task: str, repo_path: str) -> dict:
 
     # Non-executable — done immediately
     if not can_execute(target):
-        print(f"  {target} is not executable — done")
-        return {"success": True, "summary": f"Created {target}", "steps": step}
+        print(f"  {target} is not executable — validating repository")
+        step, test_out = _run_tests_step(step, repo_path)
+        if _validation_succeeded(test_out):
+            return {"success": True, "summary": f"Created {target}", "steps": step}
+        return {
+            "success": False,
+            "summary": f"Created {target} but repository tests fail",
+            "steps": step,
+        }
 
     # Run
     step += 1
@@ -1480,7 +1592,10 @@ def _run_create(task: str, repo_path: str) -> dict:
     print(f"  {run_out[:300]}")
 
     if "Return code: 0" in run_out:
-        return {"success": True, "summary": f"Created {target}", "steps": step}
+        step, test_out = _run_tests_step(step, repo_path)
+        if _validation_succeeded(test_out):
+            return {"success": True, "summary": f"Created {target}", "steps": step}
+        run_out = test_out
 
     # Timeout from input() — treat as success
     if ("Timeout" in run_out or "Return code: -1" in run_out) and _has_input_call(target, repo_path):
@@ -1519,7 +1634,12 @@ def _run_create(task: str, repo_path: str) -> dict:
         last_error = run_out
 
         if "Return code: 0" in run_out:
-            return {"success": True, "summary": f"Created {target}", "steps": step}
+            step, test_out = _run_tests_step(step, repo_path)
+            if _validation_succeeded(test_out):
+                return {"success": True, "summary": f"Created {target}", "steps": step}
+            last_error = test_out
+            print("  Repository tests failed after generated file ran successfully")
+            continue
 
         error_info = analyze_error(run_out)
         print(f"  Error: {error_info['type']} — {error_info['suggestion'][:80]}")
@@ -1623,6 +1743,144 @@ def _read_file(rel_path: str, repo_path: str) -> str:
         idx = obs.find("\n")
         return obs[idx + 1:] if idx != -1 else ""
     return obs
+
+
+def _run_tests_step(step: int, repo_path: str) -> tuple:
+    """Run repository tests as an agent validation step."""
+    step += 1
+    print(f"\nSTEP {step}: run_tests")
+    test_out = execute_tool({"tool": "run_tests", "directory": repo_path}, repo_path)
+    print(f"  {test_out[:300]}")
+    return step, test_out
+
+
+def _validation_succeeded(observation: str) -> bool:
+    """Return True when repository validation passed or was safely skipped."""
+    return "Return code: 0" in observation
+
+
+def _tests_skipped(observation: str) -> bool:
+    """Return True when no repository test command was detected."""
+    return "Tests skipped:" in observation
+
+
+def _is_test_file(rel_path: str) -> bool:
+    """Return True for common test-file paths."""
+    norm = rel_path.replace("\\", "/").lower()
+    base = os.path.basename(norm)
+    return (
+        norm.startswith("tests/")
+        or "/tests/" in norm
+        or base.startswith("test_")
+        or base.endswith("_test.py")
+        or base.endswith(".test.js")
+        or base.endswith(".spec.js")
+        or base.endswith(".test.ts")
+        or base.endswith(".spec.ts")
+    )
+
+
+def _format_plan_context(plan: list) -> str:
+    """Convert planner output into compact prompt context."""
+    if not plan:
+        return ""
+
+    lines = []
+    for step in plan[:8]:
+        step_num = step.get("step", "?")
+        action = step.get("action", "work")
+        target = step.get("target") or ""
+        description = step.get("description", "")
+        target_part = f" -> {target}" if target else ""
+        lines.append(f"{step_num}. [{action}]{target_part}: {description}")
+
+    return "\n".join(lines)
+
+
+def _get_semantic_context(task: str, current_file: str, last_error: str = "") -> list:
+    """
+    Query the semantic index for code that may be relevant to the current fix.
+    Returns retrieval chunks, excluding the file already being edited.
+    """
+    query_parts = [task, f"Current file: {current_file}"]
+    if last_error:
+        error_info = analyze_error(last_error)
+        if error_info.get("type") not in ("None", ""):
+            query_parts.append(f"Error type: {error_info['type']}")
+            query_parts.append(f"Error message: {error_info['message']}")
+        query_parts.append(last_error[-800:])
+
+    try:
+        results = query_relevant_code("\n".join(query_parts), top_k=5)
+    except Exception as exc:
+        print(f"Semantic retrieval failed: {exc}")
+        return []
+
+    filtered = []
+    for item in results:
+        if item.get("relative") == current_file:
+            continue
+        filtered.append(item)
+        if len(filtered) >= 3:
+            break
+
+    if filtered:
+        print(
+            "Semantic context: "
+            + ", ".join(f"{r['relative']}:{r['name']} ({r['score']})" for r in filtered)
+        )
+
+    return filtered
+
+
+def _language_for_path(path: str) -> str:
+    """Return a readable language name for a file path."""
+    ext = os.path.splitext(path)[1].lower()
+    names = {
+        ".py": "Python",
+        ".js": "JavaScript",
+        ".ts": "TypeScript",
+        ".jsx": "JavaScript",
+        ".tsx": "TypeScript",
+        ".c": "C",
+        ".cpp": "C++",
+        ".h": "C header",
+        ".hpp": "C++ header",
+        ".java": "Java",
+        ".html": "HTML",
+        ".css": "CSS",
+        ".scss": "SCSS",
+        ".rb": "Ruby",
+        ".go": "Go",
+        ".rs": "Rust",
+        ".sh": "Shell",
+    }
+    return names.get(ext, "code")
+
+
+def _fence_for_path(path: str) -> str:
+    """Return a markdown fence language for a file path."""
+    ext = os.path.splitext(path)[1].lower()
+    fences = {
+        ".py": "python",
+        ".js": "javascript",
+        ".ts": "typescript",
+        ".jsx": "jsx",
+        ".tsx": "tsx",
+        ".c": "c",
+        ".cpp": "cpp",
+        ".h": "c",
+        ".hpp": "cpp",
+        ".java": "java",
+        ".html": "html",
+        ".css": "css",
+        ".scss": "scss",
+        ".rb": "ruby",
+        ".go": "go",
+        ".rs": "rust",
+        ".sh": "bash",
+    }
+    return fences.get(ext, "")
 
 
 def _trace_error_to_file(traceback_str: str, repo_path: str) -> str:
@@ -1731,6 +1989,8 @@ def _build_fix_prompt(
     file_content: str,
     last_error: str = "",
     related_files: dict = None,
+    semantic_context: list = None,
+    plan_context: str = "",
 ) -> str:
     """
     Compact, complete prompt for a fix step.
@@ -1754,16 +2014,37 @@ def _build_fix_prompt(
     if related_files:
         parts = []
         for rp, rc in list(related_files.items())[:3]:
-            parts.append(f"### {rp}\n```python\n{rc[:1500]}\n```")
+            fence = _fence_for_path(rp)
+            parts.append(f"### {rp}\n```{fence}\n{rc[:1500]}\n```")
         related_section = "\nRelated files (for context):\n" + "\n".join(parts) + "\n"
 
-    return f"""Task: {task}
+    semantic_section = ""
+    if semantic_context:
+        parts = []
+        for chunk in semantic_context[:3]:
+            rel = chunk.get("relative", "?")
+            name = chunk.get("name", "?")
+            score = chunk.get("score", "?")
+            content = chunk.get("content", "")[:1500]
+            fence = _fence_for_path(rel)
+            parts.append(f"### {rel} :: {name} (score={score})\n```{fence}\n{content}\n```")
+        semantic_section = "\nSemantically relevant code:\n" + "\n".join(parts) + "\n"
 
-File to fix: {target_file}
-```python
+    plan_section = ""
+    if plan_context:
+        plan_section = f"\nCurrent plan:\n{plan_context}\n"
+
+    language = _language_for_path(target_file)
+    fence = _fence_for_path(target_file)
+
+    return f"""Task: {task}
+{plan_section}
+
+File to fix: {target_file} ({language})
+```{fence}
 {file_content}
 ```
-{related_section}{error_section}
+{related_section}{semantic_section}{error_section}
 Carefully check for ALL of the following bug types:
 1. Syntax errors (bad indentation, missing colons, etc.)
 2. Runtime errors (NameError, TypeError, ImportError, etc.)

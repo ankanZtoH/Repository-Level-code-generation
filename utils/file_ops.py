@@ -4,6 +4,7 @@ Safe file read/write/search utilities.
 """
 
 import os
+import glob
 from utils.logger import log
 
 
@@ -30,11 +31,28 @@ def write_file(path: str, content: str) -> bool:
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(content)
+        if abs_path.endswith(".py"):
+            _remove_python_cache(abs_path)
         log("TOOL", f"Wrote {len(content)} chars to {abs_path}")
         return True
     except Exception as e:
         log("ERROR", f"Failed to write {path}: {e}")
         return False
+
+
+def _remove_python_cache(source_path: str) -> None:
+    """Remove stale bytecode for a Python source file after rewriting it."""
+    module_name = os.path.splitext(os.path.basename(source_path))[0]
+    cache_dir = os.path.join(os.path.dirname(source_path), "__pycache__")
+    if not os.path.isdir(cache_dir):
+        return
+
+    pattern = os.path.join(cache_dir, f"{module_name}.*.pyc")
+    for cache_file in glob.glob(pattern):
+        try:
+            os.remove(cache_file)
+        except OSError:
+            pass
 
 
 def search_files(directory: str, query: str) -> list:

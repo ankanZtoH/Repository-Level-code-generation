@@ -16,6 +16,7 @@ Each step should be an atomic action like:
 - Modify a specific function
 - Create a new file
 - Run code to test
+- Run the repository test suite
 - Fix an error
 
 Return your plan as JSON."""
@@ -43,7 +44,7 @@ def create_plan(task: str, repo_map: str = "") -> list:
 Break this task into 3-7 concrete, sequential steps.
 Each step must have: step number, action type, description, and target file (if applicable).
 
-Action types: read, edit, create, run, search, analyze
+Action types: read, edit, create, run, test, search, analyze
 
 Return JSON:
 {{

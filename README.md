@@ -49,9 +49,9 @@ Built by combining ideas from four leading AI coding systems:
 │                              └────────────────────────────────┘ │
 │                                                                 │
 │  TOOLS (OpenHands-style)                                       │
-│  ┌──────────┬───────────┬──────────────┬──────────┐            │
-│  │read_file │write_file │search_files  │ run_code │            │
-│  └──────────┴───────────┴──────────────┴──────────┘            │
+│  ┌──────────┬───────────┬──────────────┬──────────┬──────────┐ │
+│  │read_file │write_file │search_files  │ run_code │run_tests │ │
+│  └──────────┴───────────┴──────────────┴──────────┴──────────┘ │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,6 +82,8 @@ ai-code-agent/
 │   ├── file_ops.py         # File read/write/search
 │   ├── executor.py         # Multi-language code execution
 │   └── logger.py           # Color-coded structured logging
+│
+├── tests/                  # Regression tests for validation and repo graph behavior
 │
 └── demo_repo/              # Demo files for testing
     ├── calculator.py       # Python — buggy add() function
@@ -139,6 +141,8 @@ python main.py phase1 demo_repo/style.css "Make it dark theme with modern gradie
 # Phase 2 autonomous agent
 python main.py phase2 demo_repo "Fix the bug in calculator.py where add returns a-b instead of a+b"
 ```
+
+For a complete verification checklist, see [`TESTING_GUIDE.md`](TESTING_GUIDE.md).
 
 ---
 
@@ -201,7 +205,7 @@ Tools are defined as structured objects with:
 - Name, description, parameter schema
 - A central `execute_tool()` dispatcher
 - The agent must specify tools by name in its JSON output
-- Available tools: `read_file`, `write_file`, `create_file`, `search_files`, `run_code`, `list_directory`
+- Available tools: `read_file`, `write_file`, `search_files`, `run_code`, `run_tests`
 
 ### Aider → `phase2/selector.py` + `phase1/editor.py`
 - **Repo Map**: AST-based analysis builds a codebase map (functions, classes, imports)
@@ -220,9 +224,9 @@ All settings are in `config.py` and overridable via environment variables:
 | `OLLAMA_MODEL` | `codellama` | Ollama model to use |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_TIMEOUT` | `120` | Request timeout in seconds |
-| `MAX_AGENT_STEPS` | `10` | Max iterations in agent loop |
+| `MAX_AGENT_STEPS` | `15` | Max iterations in agent loop |
 | `LLM_TEMPERATURE` | `0.1` | LLM temperature (lower = more deterministic) |
-| `LLM_NUM_CTX` | `4096` | Context window size |
+| `LLM_NUM_CTX` | `8192` | Context window size |
 
 Example:
 ```bash
@@ -266,13 +270,19 @@ The executor (`utils/executor.py`) supports:
 - **Ruby** → `ruby`
 - **Shell** → `bash`
 
-### AST Analysis
+It also detects and runs repository tests when available:
+- **Python** → `pytest -q` when pytest is installed, otherwise `unittest discover`
+- **JavaScript** → `npm test`
+- **Go** → `go test ./...`
+- **Rust** → `cargo test`
+
+### Repository Analysis
 Python files are deeply analyzed using the `ast` module to extract:
 - Function definitions (name, arguments, line numbers)
 - Class definitions (name, methods)
 - Import statements
 
-This powers the context selector's understanding of code structure.
+The analyzer also builds lightweight dependency edges for Python imports, JS/TS imports and `require()`, HTML/CSS asset links, and C/C++ quoted includes. This powers context selection and graph-aware traversal.
 
 ---
 

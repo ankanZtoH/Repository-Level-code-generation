@@ -5,8 +5,3 @@ def is_prime(n):
         if n % i == 0:
             return False
     return True
-
-if __name__ == "__main__":
-    print("Enter a number: ")
-    n = int(input())
-    print("Is the number prime? ", is_prime(n))

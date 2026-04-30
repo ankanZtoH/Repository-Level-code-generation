@@ -7,6 +7,7 @@ Other languages get basic file info (size, extension).
 
 import os
 import ast
+import re
 from utils.logger import log, separator
 from utils.file_ops import list_files, read_file
 
@@ -128,6 +129,9 @@ def _analyze_file(filepath: str, repo_root: str) -> dict:
         # Deep AST analysis only for Python
         if language == "python":
             info["has_syntax_error"] = not _analyze_python(filepath, info)
+        else:
+            source = read_file(filepath)
+            info["imports"] = extract_non_python_imports(source, language)
 
         return info
     except Exception:
@@ -193,7 +197,6 @@ def extract_imports(source: str) -> list:
         'import os, sys'                   ->  ['os', 'sys']
         'from .processor import func'      ->  ['processor']
     """
-    import re
     modules = []
     for line in source.splitlines():
         line = line.strip()
@@ -214,6 +217,33 @@ def extract_imports(source: str) -> list:
     return modules
 
 
+def extract_non_python_imports(source: str, language: str) -> list:
+    """
+    Extract lightweight dependency references for non-Python source.
+    Returns raw import/reference strings that can be resolved against repo files.
+    """
+    if not source:
+        return []
+
+    if language in ("javascript", "typescript"):
+        return _extract_js_imports(source)
+
+    if language in ("c", "cpp"):
+        return re.findall(r'^\s*#\s*include\s+"([^"]+)"', source, re.MULTILINE)
+
+    if language == "html":
+        refs = re.findall(r'\b(?:src|href)\s*=\s*["\']([^"\']+)["\']', source, re.IGNORECASE)
+        return [_clean_asset_ref(ref) for ref in refs if _is_local_asset_ref(ref)]
+
+    if language == "css":
+        refs = []
+        refs.extend(re.findall(r'@import\s+(?:url\()?["\']?([^"\')]+)', source, re.IGNORECASE))
+        refs.extend(re.findall(r'url\(["\']?([^"\')]+)', source, re.IGNORECASE))
+        return [_clean_asset_ref(ref) for ref in refs if _is_local_asset_ref(ref)]
+
+    return []
+
+
 def extract_dependency_graph(repo_path: str, file_infos: list) -> dict:
     """
     Build a dependency graph: {relative_path: [relative_paths_it_imports]}.
@@ -226,26 +256,134 @@ def extract_dependency_graph(repo_path: str, file_infos: list) -> dict:
     Returns:
         {"main.py": ["processor.py", "formatter.py"], "processor.py": ["math_utils.py"]}
     """
-    # Map base name (no ext) -> relative path for fast lookup
+    # Maps for fast resolution.
     basename_to_rel = {}
+    rel_to_rel = {}
     for fi in file_infos:
-        if fi.get("language") == "python":
-            base = os.path.splitext(os.path.basename(fi["relative"]))[0]
-            basename_to_rel[base] = fi["relative"]
+        rel_norm = _norm_rel(fi["relative"])
+        rel_to_rel[rel_norm] = fi["relative"]
+        basename_to_rel[os.path.basename(rel_norm)] = fi["relative"]
+        base = os.path.splitext(os.path.basename(rel_norm))[0]
+        basename_to_rel.setdefault(base, fi["relative"])
 
     graph = {}
     for fi in file_infos:
-        if fi.get("language") != "python":
-            continue
         rel = fi["relative"]
         source = read_file(fi["path"])
-        if not source:
-            graph[rel] = []
-            continue
-        imported_modules = extract_imports(source)
+        imported_modules = []
+        if source:
+            if fi.get("language") == "python":
+                imported_modules = extract_imports(source)
+            else:
+                imported_modules = fi.get("imports") or extract_non_python_imports(
+                    source,
+                    fi.get("language", ""),
+                )
+
         deps = []
-        for mod in imported_modules:
-            if mod in basename_to_rel and basename_to_rel[mod] != rel:
-                deps.append(basename_to_rel[mod])
+        for ref in imported_modules:
+            dep = _resolve_dependency_ref(ref, rel, rel_to_rel, basename_to_rel)
+            if dep and dep != rel and dep not in deps:
+                deps.append(dep)
         graph[rel] = deps
     return graph
+
+
+def _extract_js_imports(source: str) -> list:
+    """Extract import/require references from JavaScript or TypeScript."""
+    refs = []
+    patterns = [
+        r'\bfrom\s+["\']([^"\']+)["\']',
+        r'\bimport\s*\(\s*["\']([^"\']+)["\']\s*\)',
+        r'\bimport\s+["\']([^"\']+)["\']',
+        r'\brequire\s*\(\s*["\']([^"\']+)["\']\s*\)',
+    ]
+    for pattern in patterns:
+        refs.extend(re.findall(pattern, source))
+    return [ref for ref in refs if _is_local_module_ref(ref)]
+
+
+def _resolve_dependency_ref(
+    ref: str,
+    current_rel: str,
+    rel_to_rel: dict,
+    basename_to_rel: dict,
+) -> str:
+    """Resolve a raw import/reference string to a repo-relative file path."""
+    if not ref:
+        return ""
+
+    ref = _clean_asset_ref(ref)
+    if not ref:
+        return ""
+
+    if ref in basename_to_rel:
+        return basename_to_rel[ref]
+
+    current_dir = os.path.dirname(_norm_rel(current_rel))
+    candidates = []
+    if ref.startswith((".", "/")) or "/" in ref:
+        ref_path = ref.lstrip("/")
+        if ref.startswith("."):
+            ref_path = os.path.normpath(os.path.join(current_dir, ref))
+        candidates.extend(_dependency_candidates(ref_path))
+    else:
+        candidates.extend(_dependency_candidates(ref))
+
+    for candidate in candidates:
+        candidate = _norm_rel(candidate)
+        if candidate in rel_to_rel:
+            return rel_to_rel[candidate]
+        base = os.path.basename(candidate)
+        if base in basename_to_rel:
+            return basename_to_rel[base]
+        stem = os.path.splitext(base)[0]
+        if stem in basename_to_rel:
+            return basename_to_rel[stem]
+
+    return ""
+
+
+def _dependency_candidates(path: str) -> list:
+    """Return likely file candidates for an import/reference path."""
+    norm = _norm_rel(path)
+    _, ext = os.path.splitext(norm)
+    candidates = [norm]
+
+    if not ext:
+        for suffix in SUPPORTED_EXTENSIONS:
+            candidates.append(norm + suffix)
+        for suffix in SUPPORTED_EXTENSIONS:
+            candidates.append(os.path.join(norm, "index" + suffix))
+
+    return candidates
+
+
+def _is_local_module_ref(ref: str) -> bool:
+    """Return True for relative/local JS module references."""
+    return ref.startswith(".") or ref.startswith("/")
+
+
+def _is_local_asset_ref(ref: str) -> bool:
+    """Return True for local HTML/CSS asset references."""
+    ref = ref.strip()
+    lowered = ref.lower()
+    if not ref or ref.startswith("#"):
+        return False
+    return not (
+        lowered.startswith("http://")
+        or lowered.startswith("https://")
+        or lowered.startswith("data:")
+        or lowered.startswith("mailto:")
+        or lowered.startswith("tel:")
+    )
+
+
+def _clean_asset_ref(ref: str) -> str:
+    """Strip URL fragments/query strings from a dependency reference."""
+    return ref.strip().rstrip(";").split("#", 1)[0].split("?", 1)[0]
+
+
+def _norm_rel(path: str) -> str:
+    """Normalize a relative path while preserving repo-relative semantics."""
+    return os.path.normpath(path).replace("\\", "/")

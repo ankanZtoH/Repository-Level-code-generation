@@ -6,6 +6,7 @@ ALLOWED TOOLS:
   - read_file
   - write_file
   - run_code
+  - run_tests
   - search_files
 
 Supports ALL standard languages (Python, C, C++, Java, JS, HTML, CSS).
@@ -15,7 +16,7 @@ patch_function is permanently REMOVED.
 import os
 from utils.logger import log
 from utils.file_ops import read_file, write_file, search_files
-from utils.executor import run_code, can_execute, NON_EXECUTABLE
+from utils.executor import run_code, run_tests, can_execute, NON_EXECUTABLE
 
 
 # ─── Supported file extensions ──────────────────────────────
@@ -46,6 +47,10 @@ TOOLS = {
         "description": "Execute a code file and return output/errors. Supports Python, C, C++, Java, JS. HTML/CSS files return success immediately.",
         "parameters": {"path": "string (file path)"},
     },
+    "run_tests": {
+        "description": "Detect and run the repository's test suite when one exists.",
+        "parameters": {"directory": "string (repository directory path, optional)"},
+    },
     "search_files": {
         "description": "Search for a string in all files within a directory",
         "parameters": {"directory": "string (directory path)", "query": "string (search term)"},
@@ -60,6 +65,9 @@ TOOL_ALIASES = {
     "edit": "write_file",
     "read": "read_file",
     "run": "run_code",
+    "test": "run_tests",
+    "tests": "run_tests",
+    "run_test": "run_tests",
     "search": "search_files",
     "create_file": "write_file",
 }
@@ -116,10 +124,10 @@ def execute_tool(action: dict, repo_path: str = ".") -> str:
     tool_name = normalize_tool_name(tool_name)
 
     if not tool_name:
-        return "Error: Tool not allowed. Use only: read_file, write_file, run_code, search_files"
+        return "Error: Tool not allowed. Use only: read_file, write_file, run_code, run_tests, search_files"
 
     if tool_name not in TOOLS:
-        return f"Error: Unknown tool '{tool_name}'. Use only: read_file, write_file, run_code, search_files"
+        return f"Error: Unknown tool '{tool_name}'. Use only: read_file, write_file, run_code, run_tests, search_files"
 
     try:
         if tool_name == "read_file":
@@ -143,6 +151,22 @@ def execute_tool(action: dict, repo_path: str = ".") -> str:
             path = _resolve_path(action.get("path", action.get("file", "")), repo_path)
             result = run_code(path)
             output_parts = []
+            if result["stdout"]:
+                output_parts.append(f"STDOUT:\n{result['stdout']}")
+            if result["stderr"]:
+                output_parts.append(f"STDERR:\n{result['stderr']}")
+            output_parts.append(f"Return code: {result['returncode']}")
+            return "\n".join(output_parts)
+
+        elif tool_name == "run_tests":
+            directory = action.get("directory", action.get("path", ""))
+            test_root = _resolve_path(directory, repo_path)
+            result = run_tests(test_root)
+            output_parts = []
+            if result.get("command"):
+                output_parts.append(f"Test command: {result['command']}")
+            if result.get("skipped"):
+                output_parts.append("Tests skipped: no test command detected")
             if result["stdout"]:
                 output_parts.append(f"STDOUT:\n{result['stdout']}")
             if result["stderr"]:
