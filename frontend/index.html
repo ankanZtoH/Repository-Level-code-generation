@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AuraCode — AI Code Agent</title>
+    <meta name="description" content="Local autonomous coding agent IDE interface">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <!-- ─── Top Bar ──────────────────────────────── -->
+    <header id="topbar">
+        <div id="topbar-left">
+            <span id="logo">⚡ AuraCode</span>
+            <span class="path-input-group">
+                <span id="path-label">📁</span>
+                <input type="text" id="project-path-input" placeholder="Enter project path..." value="/Users/subham/Desktop/ET Project/ai-code-agent/demo_repo">
+                <button id="btn-open-project" title="Load Project">Load</button>
+            </span>
+        </div>
+        <div id="topbar-right">
+            <label for="model-select">Model:</label>
+            <select id="model-select">
+                <option value="codellama">codellama</option>
+            </select>
+            <span id="status-dot" class="dot-offline" title="Ollama status"></span>
+        </div>
+    </header>
+
+    <!-- ─── Main Layout ─────────────────────────── -->
+    <main id="workspace">
+
+        <!-- LEFT: File Explorer -->
+        <aside id="panel-files">
+            <div class="panel-header">FILES</div>
+            <div id="file-tree"></div>
+        </aside>
+
+        <!-- Resize Handle -->
+        <div class="resize-handle" id="resize-left"></div>
+
+        <!-- CENTER: Code Editor -->
+        <section id="panel-editor">
+            <div class="panel-header">
+                <span id="editor-filename">No file open</span>
+                <button id="btn-save" disabled title="Save file (Ctrl+S)">💾 Save</button>
+            </div>
+            <div id="editor-wrap">
+                <div id="line-numbers"></div>
+                <textarea id="code-editor" spellcheck="false" placeholder="Select a file from the explorer to view its contents..."></textarea>
+            </div>
+        </section>
+
+        <!-- Resize Handle -->
+        <div class="resize-handle" id="resize-right"></div>
+
+        <!-- RIGHT: Agent Chat + Activity Log -->
+        <aside id="panel-chat">
+            <div class="panel-header">AGENT</div>
+            <div id="chat-log"></div>
+            <div id="chat-input-area">
+                <textarea id="chat-input" rows="2" placeholder="Enter task... e.g. 'Fix the bug in calculator.py'"></textarea>
+                <button id="btn-send" title="Run task">▶ Run</button>
+            </div>
+        </aside>
+    </main>
+
+    <script src="/app.js"></script>
+</body>
+</html>

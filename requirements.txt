@@ -1,1 +1,18 @@
-requests>=2.31.0
+# ─── AuraCode — Python Dependencies ────────────────────────────────────────────
+# Install with: pip install -r requirements.txt
+# Requires Python 3.10+
+# Ollama must be running separately (not a pip package):
+#   https://ollama.ai  →  ollama pull codellama
+
+# ─── HTTP / API ─────────────────────────────────────────────────────────────────
+requests>=2.31.0          # LLM calls to Ollama REST API (utils/llm.py)
+
+# ─── Web Server (FastAPI + ASGI) ─────────────────────────────────────────────────
+fastapi>=0.100.0          # REST API & SSE streaming (server.py)
+uvicorn>=0.23.0           # ASGI server to run FastAPI
+pydantic>=2.0.0           # Request/Response models used directly in server.py
+
+# ─── Semantic Code Retrieval ─────────────────────────────────────────────────────
+sentence-transformers>=2.2.0   # Embedding model for code similarity (phase2/retrieval.py)
+                               # Downloads ~80 MB model (all-MiniLM-L6-v2) on first run
+                               # Optional: agent degrades gracefully if missing

@@ -179,3 +179,73 @@ def _analyze_python(filepath: str, info: dict) -> bool:
                 info["imports"].append(f"{module}.{alias.name}")
     
     return True
+
+
+# ─── Dependency Graph ───────────────────────────────────────
+
+def extract_imports(source: str) -> list:
+    """
+    Extract imported module names from Python source using regex.
+    Works even if the file has syntax errors (no AST needed).
+    
+    Returns list of module base names, e.g.:
+        'from math_utils import multiply'  ->  ['math_utils']
+        'import os, sys'                   ->  ['os', 'sys']
+        'from .processor import func'      ->  ['processor']
+    """
+    import re
+    modules = []
+    for line in source.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            continue
+        # from X import Y  /  from .X import Y
+        m = re.match(r"from\s+\.?(\w[\w.]*)\s+import", line)
+        if m:
+            modules.append(m.group(1).split(".")[0])
+            continue
+        # import X, Y
+        m = re.match(r"import\s+(.+)", line)
+        if m:
+            for part in m.group(1).split(","):
+                name = part.strip().split()[0].split(".")[0]
+                if name:
+                    modules.append(name)
+    return modules
+
+
+def extract_dependency_graph(repo_path: str, file_infos: list) -> dict:
+    """
+    Build a dependency graph: {relative_path: [relative_paths_it_imports]}.
+    Only includes files that actually exist in the repo.
+
+    Args:
+        repo_path:  absolute path to the repo root
+        file_infos: list of file info dicts from analyze_repo()
+
+    Returns:
+        {"main.py": ["processor.py", "formatter.py"], "processor.py": ["math_utils.py"]}
+    """
+    # Map base name (no ext) -> relative path for fast lookup
+    basename_to_rel = {}
+    for fi in file_infos:
+        if fi.get("language") == "python":
+            base = os.path.splitext(os.path.basename(fi["relative"]))[0]
+            basename_to_rel[base] = fi["relative"]
+
+    graph = {}
+    for fi in file_infos:
+        if fi.get("language") != "python":
+            continue
+        rel = fi["relative"]
+        source = read_file(fi["path"])
+        if not source:
+            graph[rel] = []
+            continue
+        imported_modules = extract_imports(source)
+        deps = []
+        for mod in imported_modules:
+            if mod in basename_to_rel and basename_to_rel[mod] != rel:
+                deps.append(basename_to_rel[mod])
+        graph[rel] = deps
+    return graph
