@@ -66,7 +66,21 @@ def query_llm_json(prompt: str, system_prompt: str = "") -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        log("ERROR", f"Failed to parse LLM JSON output:\n{raw[:300]}")
+        log("ERROR", f"Invalid JSON from LLM — retrying with correction prompt")
+        # Retry once with correction prompt
+        retry_raw = query_llm(
+            f"Your previous response was not valid JSON. Here is what you returned:\n"
+            f"{raw[:500]}\n\n"
+            f"Fix it and return ONLY valid JSON. No explanations.",
+            system_prompt=system_prompt,
+            expect_json=True,
+        )
+        if retry_raw:
+            try:
+                return json.loads(retry_raw)
+            except json.JSONDecodeError:
+                pass
+        log("ERROR", f"JSON retry also failed:\n{raw[:200]}")
         return {}
 
 

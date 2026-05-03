@@ -55,21 +55,49 @@ def _validate_brackets(content: str, filepath: str) -> tuple:
     in_string = False
     string_char = None
     escape = False
+    in_line_comment = False
+    in_block_comment = False
+    prev_ch = ""
 
     for i, ch in enumerate(content):
+        # Handle block comment end
+        if in_block_comment:
+            if prev_ch == "*" and ch == "/":
+                in_block_comment = False
+            prev_ch = ch
+            continue
+        # Handle line comment end
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            prev_ch = ch
+            continue
         if escape:
             escape = False
+            prev_ch = ch
             continue
         if ch == "\\":
             escape = True
+            prev_ch = ch
+            continue
+        # Detect comment starts (before string check)
+        if not in_string and prev_ch == "/" and ch == "/":
+            in_line_comment = True
+            prev_ch = ch
+            continue
+        if not in_string and prev_ch == "/" and ch == "*":
+            in_block_comment = True
+            prev_ch = ch
             continue
         if in_string:
             if ch == string_char:
                 in_string = False
+            prev_ch = ch
             continue
         if ch in ("'", '"', '`'):
             in_string = True
             string_char = ch
+            prev_ch = ch
             continue
 
         if ch in ("(", "[", "{"):
@@ -82,6 +110,7 @@ def _validate_brackets(content: str, filepath: str) -> tuple:
                 line = content[:i].count("\n") + 1
                 return False, f"Mismatched '{ch}' at line {line}, expected closing for '{stack[-1]}'"
             stack.pop()
+        prev_ch = ch
 
     if stack:
         return False, f"Unclosed bracket(s): {''.join(stack)}"

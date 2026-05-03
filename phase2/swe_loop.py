@@ -222,6 +222,15 @@ When done, use:
 4. Run code to verify
 5. Signal done when fixed
 
+## LANGUAGE RULES (CRITICAL)
+- ALWAYS match the language to the file extension
+- .js files → ONLY JavaScript (use function/const/let, true/false/null, {{ }} blocks)
+- .py files → ONLY Python (use def, True/False/None, indentation)
+- .html files → ONLY HTML5
+- .css files → ONLY CSS
+- NEVER write Python syntax (def, range, True/False, None) inside a .js file
+- NEVER write JavaScript syntax (function, const, let) inside a .py file
+
 ## IMPORTANT
 - Read before editing — NEVER guess file contents
 - Fix ONE issue at a time

@@ -36,13 +36,27 @@ def create_plan(task: str, repo_map: str = "") -> list:
     if repo_map:
         context = f"\n\n## Repository Structure\n{repo_map}"
 
+    # Detect target language from task text
+    import re as _re
+    lang_hint = ""
+    file_mentions = _re.findall(r'\b\w+\.(js|py|html|css|ts|java|c|cpp)\b', task.lower())
+    if file_mentions:
+        ext_to_lang = {
+            "js": "JavaScript", "py": "Python", "html": "HTML", "css": "CSS",
+            "ts": "TypeScript", "java": "Java", "c": "C", "cpp": "C++",
+        }
+        detected = set(ext_to_lang.get(e, e) for e in file_mentions)
+        lang_hint = f"\n\nIMPORTANT: Target files use {', '.join(detected)}. " \
+                    f"ALL steps must use the correct language. " \
+                    f"Do NOT assume Python if the files are {', '.join(detected)}.\n"
+
     prompt = f"""## Task
 {task}
-{context}
-
+{context}{lang_hint}
 ## Instructions
 Break this task into 3-7 concrete, sequential steps.
 Each step must have: step number, action type, description, and target file (if applicable).
+Use the CORRECT language for each file (e.g. JavaScript for .js, Python for .py).
 
 Action types: read, edit, create, run, test, search, analyze
 

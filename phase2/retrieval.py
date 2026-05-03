@@ -11,9 +11,12 @@ Usage:
 """
 
 import os
+import re as _re
 import math
 import logging
+from collections import Counter
 from utils.file_ops import read_file
+from utils.logger import log
 
 logger = logging.getLogger(__name__)
 
@@ -38,22 +41,24 @@ def index_repo(repo_analysis: dict) -> int:
     global _INDEX
     _INDEX = []
 
-    model = _get_model()
-    if model is None:
-        logger.warning("sentence-transformers not available — retrieval disabled")
-        return 0
-
     chunks = _extract_chunks(repo_analysis)
     if not chunks:
         return 0
 
-    texts = [c["content"] for c in chunks]
-    embeddings = _encode(model, texts)
+    model = _get_model()
+    if model is not None:
+        # Full semantic embeddings
+        texts = [c["content"] for c in chunks]
+        embeddings = _encode(model, texts)
+        for chunk, emb in zip(chunks, embeddings):
+            _INDEX.append({**chunk, "embedding": emb})
+    else:
+        # TF-IDF fallback — store tokenized form instead of embeddings
+        for chunk in chunks:
+            _INDEX.append({**chunk, "embedding": None, "_tokens": _tokenize(chunk["content"])})
+        log("INFO", f"Using TF-IDF fallback for {len(chunks)} chunks")
 
-    for chunk, emb in zip(chunks, embeddings):
-        _INDEX.append({**chunk, "embedding": emb})
-
-    logger.info(f"Indexed {len(_INDEX)} chunks from {repo_analysis.get('path', '?')}")
+    log("INFO", f"Indexed {len(_INDEX)} chunks from {repo_analysis.get('path', '?')}")
     return len(_INDEX)
 
 
@@ -78,15 +83,21 @@ def query_relevant_code(task: str, top_k: int = 3) -> list:
         logger.warning("Index is empty — call index_repo() first")
         return []
 
-    model = _get_model()
-    if model is None:
-        return []
+    # Check if we have real embeddings or TF-IDF fallback
+    has_embeddings = _INDEX[0].get("embedding") is not None
 
-    query_emb = _encode(model, [task])[0]
-    scored = [
-        (chunk, _cosine(query_emb, chunk["embedding"]))
-        for chunk in _INDEX
-    ]
+    if has_embeddings:
+        model = _get_model()
+        if model is None:
+            return _tfidf_query(task, top_k)
+        query_emb = _encode(model, [task])[0]
+        scored = [
+            (chunk, _cosine(query_emb, chunk["embedding"]))
+            for chunk in _INDEX
+        ]
+    else:
+        scored = _tfidf_query_scored(task)
+
     scored.sort(key=lambda x: x[1], reverse=True)
 
     return [
@@ -200,15 +211,15 @@ def _get_model():
     try:
         from sentence_transformers import SentenceTransformer
         _MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-        print("Loaded embedding model: all-MiniLM-L6-v2")
+        log("INFO", "Loaded embedding model: all-MiniLM-L6-v2")
 
     except ImportError:
-        print("ERROR: sentence-transformers not installed.")
-        print("Run: pip install sentence-transformers")
+        log("ERROR", "sentence-transformers not installed.")
+        log("INFO", "Run: pip install sentence-transformers")
         return None
 
     except Exception as e:
-        print(f"ERROR: Failed to load embedding model: {e}")
+        log("ERROR", f"Failed to load embedding model: {e}")
         return None
 
     return _MODEL
@@ -244,3 +255,53 @@ def _cosine(a: list, b: list) -> float:
     Equivalent to dot product when both are unit vectors.
     """
     return sum(x * y for x, y in zip(a, b))
+
+
+# ─── TF-IDF Fallback (no external dependencies) ─────────────
+
+def _tokenize(text: str) -> Counter:
+    """Tokenize text into lowercase word counts."""
+    words = _re.findall(r'[a-zA-Z_]\w{2,}', text.lower())
+    return Counter(words)
+
+
+def _tfidf_similarity(query_tokens: Counter, doc_tokens: Counter) -> float:
+    """Compute simple TF-IDF cosine similarity between query and document."""
+    if not query_tokens or not doc_tokens:
+        return 0.0
+    # Shared vocabulary
+    shared = set(query_tokens.keys()) & set(doc_tokens.keys())
+    if not shared:
+        return 0.0
+    # Simple TF overlap score (normalized)
+    dot = sum(query_tokens[w] * doc_tokens[w] for w in shared)
+    norm_q = math.sqrt(sum(v * v for v in query_tokens.values()))
+    norm_d = math.sqrt(sum(v * v for v in doc_tokens.values()))
+    if norm_q == 0 or norm_d == 0:
+        return 0.0
+    return dot / (norm_q * norm_d)
+
+
+def _tfidf_query_scored(task: str) -> list:
+    """TF-IDF fallback: rank indexed chunks by token similarity."""
+    query_tokens = _tokenize(task)
+    return [
+        (chunk, _tfidf_similarity(query_tokens, chunk.get("_tokens", Counter())))
+        for chunk in _INDEX
+    ]
+
+
+def _tfidf_query(task: str, top_k: int = 3) -> list:
+    """TF-IDF fallback for query_relevant_code when no embedding model."""
+    scored = _tfidf_query_scored(task)
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [
+        {
+            "path":     chunk["path"],
+            "relative": chunk["relative"],
+            "name":     chunk["name"],
+            "content":  chunk["content"],
+            "score":    round(score, 4),
+        }
+        for chunk, score in scored[:top_k]
+    ]

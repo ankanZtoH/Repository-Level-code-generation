@@ -22,6 +22,7 @@ BUG TYPES HANDLED:
 import os
 import re
 import ast
+import hashlib
 from config import MAX_RETRIES, MAX_AGENT_STEPS
 from utils.logger import log, separator
 from utils.llm import query_llm_json
@@ -120,6 +121,9 @@ _CREATE_KEYWORDS = {
 # ─── System Prompts ─────────────────────────────────────────
 AGENT_SYSTEM_PROMPT = """You are a coding agent that fixes bugs in code files.
 RULES:
+- CRITICAL: Match the language to the file extension. .js = JavaScript, .py = Python, .html = HTML, .css = CSS.
+- NEVER write Python syntax (def, True/False, range, None) inside a .js file.
+- NEVER write JavaScript syntax (function, const, let, =>) inside a .py file.
 - The "content" field MUST contain the actual source code of the fixed file.
 - Write the COMPLETE file — every function, every line, nothing omitted.
 - "path" must be the exact relative filename (e.g. "calculator.py").
@@ -308,7 +312,9 @@ def _self_correct(target: str, repo_path: str, entry_point: str,
             f"Fix the error in '{target}'.\n\n"
             f"## Current Code\n```\n{content}\n```\n\n"
             f"## Error Output\n```\n{run_out[-1500:]}\n```\n\n"
-            f"## Error Analysis\nType: {error_info['type']}\n"
+            f"## Error Analysis\n"
+            f"Type: {error_info['type']}\n"
+            f"Message: {error_info.get('message', '')}\n"
             f"Suggestion: {error_info.get('suggestion', 'Fix the error')}\n\n"
             f"Provide the ENTIRE fixed file.\n"
             f"Respond with JSON:\n"
@@ -347,6 +353,8 @@ def _run_fix_targeted(
     visited = set()
     files_modified = []
     last_run_output = ""
+    action_history = set()   # (action, file, content_hash) for dedup
+    plan_step_idx = 0        # tracks current planner step
     # Seed queue: entry point first, then its direct deps
     queue = [entry_point]
     for dep in dep_graph.get(entry_point, []):
@@ -452,6 +460,21 @@ def _run_fix_targeted(
         new_content = _ensure_symbol_preservation(prompt, target, orig_content, new_content)
         if not new_content:
             continue
+        # Action dedup: skip if we already wrote identical content to this file
+        content_hash = hashlib.md5(new_content.encode()).hexdigest()[:8]
+        action_key = ("write", target, content_hash)
+        if action_key in action_history:
+            log("THOUGHT", f"Skipping duplicate write to {target} (same content)")
+            continue
+        action_history.add(action_key)
+        # Language contamination check: catch Python syntax in .js files etc.
+        new_content = _fix_language_contamination(target, new_content, task)
+        if not new_content:
+            continue
+        # Auto-fix bracket issues for C-like languages (JS/TS/Java/C)
+        ext = os.path.splitext(target)[1].lower()
+        if ext in ('.js', '.ts', '.jsx', '.tsx', '.java', '.c', '.cpp'):
+            new_content = _autofix_brackets(new_content)
         # Write the fix
         step += 1
         log("ACTION", f"Step {step}: write_file {target}")
@@ -461,6 +484,8 @@ def _run_fix_targeted(
             continue
         if target not in files_modified:
             files_modified.append(target)
+        # Advance plan step
+        plan_step_idx = _advance_plan_step(plan_context, plan_step_idx, target, "edit")
         log("OBSERVATION", f"Written: {target}")
         # Non-runnable file — skip verification, treat write as success
         if not can_execute(entry_point):
@@ -1195,6 +1220,27 @@ def _format_plan_context(plan: list) -> str:
         target_part = f" -> {target}" if target else ""
         lines.append(f"{step_num}. [{action}]{target_part}: {description}")
     return "\n".join(lines)
+
+
+def _advance_plan_step(plan_context: str, current_idx: int, current_file: str, action: str) -> int:
+    """
+    Check if the current action matches the current plan step.
+    If it does, advance the step index and log the progression.
+    Returns the (possibly advanced) step index.
+    """
+    if not plan_context:
+        return current_idx
+    lines = plan_context.strip().splitlines()
+    if current_idx >= len(lines):
+        return current_idx
+    current_line = lines[current_idx].lower()
+    # Check if the current file or action matches the plan step
+    file_match = current_file and current_file.lower() in current_line
+    action_match = action.lower() in current_line
+    if file_match or action_match:
+        log("PLAN", f"✓ Plan step {current_idx + 1} completed: {lines[current_idx].strip()}")
+        return current_idx + 1
+    return current_idx
 def _get_semantic_context(task: str, current_file: str, last_error: str = "") -> list:
     """
     Query the semantic index for code that may be relevant to the current fix.
@@ -1248,6 +1294,337 @@ def _language_for_path(path: str) -> str:
         ".sh": "Shell",
     }
     return names.get(ext, "code")
+
+
+def _language_enforcement(path: str) -> str:
+    """
+    Generate strict language enforcement instructions for the LLM
+    based on the file extension. Prevents cross-language contamination.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    rules = {
+        ".js": (
+            "⚠️ LANGUAGE CONSTRAINT: This is a JavaScript (.js) file.\n"
+            "You MUST write ONLY valid JavaScript.\n"
+            "FORBIDDEN in JavaScript:\n"
+            "  - Python keywords: def, class(with colon), range(), True, False, None, print()\n"
+            "  - Python syntax: 'for x in range()', 'if x is None', indentation-based blocks\n"
+            "REQUIRED JavaScript syntax:\n"
+            "  - Use function/const/let/var for declarations\n"
+            "  - Use true/false/null (lowercase) not True/False/None\n"
+            "  - Use { } for blocks, not indentation\n"
+            "  - Use === for comparison, not 'is'\n"
+            "  - Use for(let i=0; i<n; i++) not for i in range(n)"
+        ),
+        ".py": (
+            "⚠️ LANGUAGE CONSTRAINT: This is a Python (.py) file.\n"
+            "You MUST write ONLY valid Python.\n"
+            "FORBIDDEN in Python:\n"
+            "  - JavaScript keywords: function, const, let, var, =>\n"
+            "  - JavaScript syntax: { } blocks, === comparison\n"
+            "REQUIRED Python syntax:\n"
+            "  - Use def for functions\n"
+            "  - Use True/False/None (capitalized)\n"
+            "  - Use indentation for blocks"
+        ),
+        ".html": (
+            "⚠️ LANGUAGE CONSTRAINT: This is an HTML (.html) file.\n"
+            "You MUST write ONLY valid HTML5.\n"
+            "No Python or raw JavaScript in this file — use <script src> to link JS."
+        ),
+        ".css": (
+            "⚠️ LANGUAGE CONSTRAINT: This is a CSS (.css) file.\n"
+            "You MUST write ONLY valid CSS.\n"
+            "No JavaScript or Python in this file."
+        ),
+    }
+    return rules.get(ext, "")
+
+
+def _fix_language_contamination(path: str, content: str, task: str) -> str:
+    """
+    Detect and fix wrong-language content in a file.
+    E.g. Python syntax (def, range, True/False) in a .js file.
+    Returns corrected content, or empty string to skip the write.
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".js":
+        # Check for Python syntax in JavaScript
+        python_patterns = [
+            (r'^def\s+\w+\s*\(', "Python 'def' function"),
+            (r'\bfor\s+\w+\s+in\s+range\(', "Python 'for...in range()'"),
+            (r'\b(?:True|False|None)\b', "Python True/False/None"),
+            (r'^\s*print\(', "Python print()"),
+        ]
+        contaminated = []
+        for pattern, label in python_patterns:
+            if re.search(pattern, content, re.MULTILINE):
+                contaminated.append(label)
+
+        if contaminated:
+            log("ERROR", f"Language contamination in {path}: {', '.join(contaminated)}")
+            log("ACTION", "Retrying with explicit JavaScript rewrite prompt")
+            # Retry with a very explicit rewrite prompt
+            retry_prompt = (
+                f"The following file is named {path} (a JavaScript file) but contains "
+                f"Python syntax: {', '.join(contaminated)}.\n\n"
+                f"CURRENT BROKEN CONTENT:\n```\n{content}\n```\n\n"
+                f"TASK: {task}\n\n"
+                f"REWRITE this entire file in pure, valid JavaScript.\n"
+                f"Rules:\n"
+                f"- Use function/const/let (NOT Python def)\n"
+                f"- Use true/false/null (NOT Python True/False/None)\n"
+                f"- Use for(let i=0; i<n; i++) (NOT Python for i in range())\n"
+                f"- Use {{ }} for blocks (NOT Python indentation)\n"
+                f"- Use === for comparison (NOT Python 'is')\n\n"
+                f"Return JSON:\n"
+                f'{{\"thought\": \"rewriting Python to JavaScript\", \"tool\": \"write_file\", '
+                f'\"path\": \"{path}\", \"content\": \"FULL JAVASCRIPT FILE\", \"done\": false}}'
+            )
+            resp = query_llm_json(retry_prompt, system_prompt=(
+                "You are a JavaScript expert. Rewrite the given Python code into "
+                "valid JavaScript. Return ONLY JSON with the full file content."
+            ))
+            if resp and resp.get("content"):
+                new_content = resp["content"]
+                # Clean common LLM artifacts: leading/trailing JSON braces
+                new_content = new_content.strip()
+                if new_content.startswith("}"):
+                    new_content = new_content[1:].strip()
+                if new_content.endswith('"}'):
+                    new_content = new_content[:-2].strip()
+                # Verify the retry didn't also fail
+                still_bad = any(
+                    re.search(p, new_content, re.MULTILINE)
+                    for p, _ in python_patterns
+                )
+                if not still_bad:
+                    log("INFO", f"Language contamination fixed in {path}")
+                    new_content = _autofix_brackets(new_content)
+                    return new_content
+                else:
+                    log("ERROR", f"Retry still has Python — applying rule-based transpiler")
+                    return _transpile_python_to_js(content)
+            # LLM retry returned nothing — apply rule-based transpiler
+            log("ERROR", f"LLM retry failed — applying rule-based transpiler")
+            return _transpile_python_to_js(content)
+
+    elif ext == ".py":
+        # Check for JavaScript syntax in Python
+        js_patterns = [
+            (r'\bfunction\s+\w+\s*\(', "JavaScript 'function'"),
+            (r'\b(?:const|let|var)\s+\w+', "JavaScript const/let/var"),
+            (r'=>', "JavaScript arrow function"),
+        ]
+        contaminated = [label for pattern, label in js_patterns
+                        if re.search(pattern, content, re.MULTILINE)]
+        if contaminated:
+            log("ERROR", f"Language contamination in {path}: {', '.join(contaminated)}")
+            return ""  # Skip writing — don't corrupt the Python file
+
+    return content
+
+
+def _transpile_python_to_js(content: str) -> str:
+    """
+    Rule-based Python → JavaScript transpiler for common patterns.
+    Last-resort fallback when the LLM fails to convert.
+    Tracks indentation to properly place closing braces.
+    """
+    log("ACTION", "Applying rule-based Python→JS transpiler")
+    lines = content.split("\n")
+    result = []
+    # Stack of indentation levels for open blocks
+    block_indents = []
+
+    for line in lines:
+        stripped = line.rstrip()
+        if not stripped:
+            result.append("")
+            continue
+
+        indent = len(line) - len(line.lstrip())
+
+        # Close blocks when indentation decreases
+        while block_indents and indent <= block_indents[-1]:
+            closed_indent = block_indents.pop()
+            result.append(" " * closed_indent + "}")
+
+        # --- Pattern matching ---
+
+        # def func(args): → function func(args) {
+        m = re.match(r'^(\s*)def\s+(\w+)\s*\(([^)]*)\)\s*:\s*$', stripped)
+        if m:
+            result.append(f"{m.group(1)}function {m.group(2)}({m.group(3)}) {{")
+            block_indents.append(indent)
+            continue
+
+        # function name(): (hybrid JS/Python) → function name() {
+        m = re.match(r'^(\s*)function\s+(\w+)\s*\(([^)]*)\)\s*:\s*$', stripped)
+        if m:
+            result.append(f"{m.group(1)}function {m.group(2)}({m.group(3)}) {{")
+            block_indents.append(indent)
+            continue
+
+        # for x in range(n): → for (let x = 0; x < n; x++) {
+        m = re.match(r'^(\s*)for\s+(\w+)\s+in\s+range\((.+?)\)\s*:\s*$', stripped)
+        if m:
+            var = m.group(2)
+            raw_arg = m.group(3).strip()
+            # Convert ** to Math.pow before splitting
+            raw_arg = re.sub(r'(\w+)\s*\*\*\s*(\w+)', r'Math.pow(\1, \2)', raw_arg)
+            if ',' in raw_arg and 'Math.pow' not in raw_arg:
+                parts = [p.strip() for p in raw_arg.split(',')]
+                result.append(f"{m.group(1)}for (let {var} = {parts[0]}; {var} < {parts[1]}; {var}++) {{")
+            else:
+                result.append(f"{m.group(1)}for (let {var} = 0; {var} < {raw_arg}; {var}++) {{")
+            block_indents.append(indent)
+            continue
+
+        # if condition: → if (condition) {
+        m = re.match(r'^(\s*)if\s+(.+?)\s*:\s*$', stripped)
+        if m:
+            cond = _py_expr_to_js(m.group(2))
+            result.append(f"{m.group(1)}if ({cond}) {{")
+            block_indents.append(indent)
+            continue
+
+        # elif condition: → } else if (condition) {
+        m = re.match(r'^(\s*)elif\s+(.+?)\s*:\s*$', stripped)
+        if m:
+            cond = _py_expr_to_js(m.group(2))
+            result.append(f"{m.group(1)}}} else if ({cond}) {{")
+            continue
+
+        # else: → } else {
+        m = re.match(r'^(\s*)else\s*:\s*$', stripped)
+        if m:
+            result.append(f"{m.group(1)}}} else {{")
+            continue
+
+        # return statement
+        m = re.match(r'^(\s*)return\s+(.*)', stripped)
+        if m:
+            expr = _py_expr_to_js(m.group(2))
+            result.append(f"{m.group(1)}return {expr};")
+            continue
+
+        # Pass-through JS lines that are already valid (arrow functions, addEventListener, etc.)
+        if re.match(r'^\s*(document\.|const |let |var |//|/\*|\*/|\})', stripped):
+            result.append(stripped)
+            continue
+
+        # print(...) → console.log(...)
+        transformed = re.sub(r'\bprint\(', 'console.log(', stripped)
+
+        # Expression transforms
+        transformed = _py_expr_to_js(transformed)
+
+        # Add semicolons to simple statements
+        t = transformed.strip()
+        if t and not t.endswith(('{', '}', ';', '//', '*/', '(', ',')) \
+                and not t.startswith(('function', 'if', 'else', 'for', 'while', '//')):
+            transformed = transformed.rstrip() + ';'
+
+        result.append(transformed)
+
+    # Close any remaining open blocks
+    while block_indents:
+        closed_indent = block_indents.pop()
+        result.append(" " * closed_indent + "}")
+
+    output = "\n".join(result)
+
+    # Replace Python keywords globally
+    output = re.sub(r'\bTrue\b', 'true', output)
+    output = re.sub(r'\bFalse\b', 'false', output)
+    output = re.sub(r'\bNone\b', 'null', output)
+
+    log("INFO", "Rule-based transpilation complete")
+    return output
+
+
+def _py_expr_to_js(expr: str) -> str:
+    """Convert Python expression patterns to JavaScript equivalents."""
+    # // integer division → Math.floor(a / b) — must be first!
+    expr = re.sub(r'(\w[\w\[\]\.]*)\s*//\s*(\w[\w\[\]\.]*)', r'Math.floor(\1 / \2)', expr)
+    # is not → !==
+    expr = re.sub(r'\bis\s+not\b', '!==', expr)
+    # is → ===
+    expr = re.sub(r'\bis\b', '===', expr)
+    # not → !
+    expr = re.sub(r'\bnot\b', '!', expr)
+    # and → &&
+    expr = re.sub(r'\band\b', '&&', expr)
+    # or → ||
+    expr = re.sub(r'\bor\b', '||', expr)
+    # ** → Math.pow (simple cases)
+    expr = re.sub(r'(\w+)\s*\*\*\s*(\w+)', r'Math.pow(\1, \2)', expr)
+    # f-string '{}'.format() → template literal (basic)
+    expr = re.sub(r"'([^']*)'\.format\(([^)]+)\)", r'`\1`.replace("{}", \2)', expr)
+    return expr
+
+
+def _autofix_brackets(content: str) -> str:
+    """
+    Auto-fix minor bracket mismatches from LLM output.
+    Strips leading stray closing brackets and appends missing ones.
+    Only handles simple cases — won't fix deeply broken code.
+    """
+    pairs = {")": "(", "]": "[", "}": "{"}
+    openers = {"(", "[", "{"}
+    closers = {")", "]", "}"}
+    reverse_pairs = {"(": ")", "[": "]", "{": "}"}
+
+    # Strip leading stray closing brackets (common LLM artifact)
+    # First: strip if content literally starts with a closer
+    content = content.lstrip()
+    while content and content[0] in closers:
+        log("INFO", f"Auto-fix: stripped leading stray '{content[0]}'")
+        content = content[1:].lstrip()
+    # Also strip full lines that are just a bracket
+    lines = content.split("\n")
+    while lines and lines[0].strip() in closers:
+        log("INFO", f"Auto-fix: stripped leading stray line '{lines[0].strip()}'")
+        lines.pop(0)
+    content = "\n".join(lines)
+
+    # Count unmatched brackets
+    stack = []
+    in_string = False
+    string_char = None
+    escape = False
+
+    for ch in content:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if in_string:
+            if ch == string_char:
+                in_string = False
+            continue
+        if ch in ("'", '"', '`'):
+            in_string = True
+            string_char = ch
+            continue
+        if ch in openers:
+            stack.append(ch)
+        elif ch in closers:
+            if stack and stack[-1] == pairs[ch]:
+                stack.pop()
+            # else: stray closer, ignore
+
+    # Append missing closing brackets
+    if stack:
+        missing = "".join(reverse_pairs[ch] for ch in reversed(stack))
+        log("INFO", f"Auto-fix: appending missing '{missing}'")
+        content = content.rstrip() + "\n" + missing + "\n"
+
+    return content
 def _fence_for_path(path: str) -> str:
     """Return a markdown fence language for a file path."""
     ext = os.path.splitext(path)[1].lower()
@@ -1495,8 +1872,10 @@ def _build_fix_prompt(
         plan_section = f"\nCurrent plan:\n{plan_context}\n"
     language = _language_for_path(target_file)
     fence = _fence_for_path(target_file)
+    lang_enforcement = _language_enforcement(target_file)
     return f"""Task: {task}
 {plan_section}
+{lang_enforcement}
 File to fix: {target_file} ({language})
 ```{fence}
 {file_content}
@@ -1511,9 +1890,12 @@ Carefully check for ALL of the following bug types:
    - def add(a, b): return a * b        ← WRONG, should be a + b
    - def subtract(a, b): return a + b   ← WRONG, should be a - b
    Fix the operator to match the function name.
-4. Logic errors (wrong formula, wrong condition, etc.)
+4. WRONG LANGUAGE — if the file contains code in the wrong language
+   (e.g. Python def/range/True in a .js file), rewrite it entirely
+   in the correct language for the file extension.
 Provide the ENTIRE fixed file — do not omit any functions or lines.
 The "path" field must be the exact filename you are fixing.
+The output MUST be valid {language} code. No other language.
 Respond with JSON:
 {{"thought": "...", "tool": "write_file", "path": "{target_file}", "content": "ENTIRE FILE", "done": false}}
 If no bugs exist in this file:

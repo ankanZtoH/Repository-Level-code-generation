@@ -17,10 +17,11 @@ _CODE_LANGUAGES = {
 _WEB_LANGUAGES = {"html", "css", "javascript", "typescript"}
 
 
-def select_context(task: str, repo_analysis: dict, max_files: int = 3) -> list:
+def select_context(task: str, repo_analysis: dict, max_files: int = 3,
+                    retrieval_results: list = None) -> list:
     """
     Select the most relevant files for a task.
-    Uses keyword-based heuristic ranking. Supports all languages.
+    Combines heuristic ranking with retrieval scores when available.
 
     Returns list of dicts:
         [{"path": str, "relative": str, "content": str, "reason": str}]
@@ -35,6 +36,11 @@ def select_context(task: str, repo_analysis: dict, max_files: int = 3) -> list:
 
     # Rank by heuristic score
     scored = _heuristic_rank(task, files)
+
+    # Merge retrieval scores if available
+    if retrieval_results:
+        scored = _merge_retrieval_scores(scored, retrieval_results)
+
     selected = scored[:max_files]
 
     # Load content for selected files
@@ -115,6 +121,34 @@ def _heuristic_rank(task: str, files: list) -> list:
             score += 1
 
         scored.append({**f, "_score": score})
+
+    scored.sort(key=lambda x: (-x["_score"], x["size"]))
+    return scored
+
+
+def _merge_retrieval_scores(scored: list, retrieval_results: list) -> list:
+    """
+    Boost heuristic scores for files that also appear in retrieval results.
+    Retrieval score (0-1) is scaled to 0-15 bonus points.
+    """
+    if not retrieval_results:
+        return scored
+
+    # Build lookup: relative_path -> retrieval score
+    retrieval_map = {}
+    for r in retrieval_results:
+        rel = r.get("relative", "")
+        score = r.get("score", 0)
+        # A file may appear multiple times (multiple chunks) — keep highest
+        if rel not in retrieval_map or score > retrieval_map[rel]:
+            retrieval_map[rel] = score
+
+    for item in scored:
+        rel = item.get("relative", "")
+        if rel in retrieval_map:
+            bonus = int(retrieval_map[rel] * 15)
+            item["_score"] += bonus
+            log("CONTEXT", f"Retrieval boost: {rel} +{bonus} (similarity={retrieval_map[rel]:.3f})")
 
     scored.sort(key=lambda x: (-x["_score"], x["size"]))
     return scored
