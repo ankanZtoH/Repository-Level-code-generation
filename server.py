@@ -48,7 +48,7 @@ def _strip_ansi(text: str) -> str:
 
 # ─── App Setup ──────────────────────────────────────────────
 
-app = FastAPI(title="AuraCode", version="1.0")
+app = FastAPI(title="Gravity", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,6 +63,7 @@ app.add_middleware(
 class TaskRequest(BaseModel):
     task: str
     repo_path: str
+    mode: str = "auto"  # "auto", "swe", "fix", "create"
 
 class WriteFileRequest(BaseModel):
     path: str
@@ -162,8 +163,9 @@ class StreamingAgentRunner:
     def _emit(self, event_type: str, data: dict):
         self.event_queue.put({"type": event_type, **data})
 
-    def run_task(self, task: str, repo_path: str):
+    def run_task(self, task: str, repo_path: str, mode: str = "auto"):
         """Run the agent task in a background thread."""
+        self._mode = mode
 
         def _worker():
             import builtins
@@ -225,9 +227,12 @@ class StreamingAgentRunner:
                 tools_module.execute_tool = tracked_execute
                 agent_module.execute_tool = tracked_execute
 
-                # Actually run the agent
-                from phase2.agent import run_agent
-                result = run_agent(task, repo_path)
+                # Actually run the agent — dispatch by mode
+                from phase2.agent import run_agent, run_agent_swe
+                if self._mode == "swe":
+                    result = run_agent_swe(task, repo_path)
+                else:
+                    result = run_agent(task, repo_path)
 
                 # Restore both references
                 tools_module.execute_tool = original_execute_tools
@@ -366,7 +371,7 @@ def run_task(req: TaskRequest):
     """
     global runner
     runner = StreamingAgentRunner()
-    runner.run_task(req.task, req.repo_path)
+    runner.run_task(req.task, req.repo_path, mode=req.mode)
 
     return StreamingResponse(
         runner.stream_events(),

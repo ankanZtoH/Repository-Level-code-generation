@@ -63,10 +63,37 @@ class ValidationAndGraphTests(unittest.TestCase):
             analysis = analyze_repo(tmp)
             graph = extract_dependency_graph(tmp, analysis["files"])
 
+            self.assertIn("code_tree", analysis)
+            self.assertIn("call_graph", analysis)
+            self.assertIn("important_files", analysis)
             self.assertEqual(set(graph["index.html"]), {"style.css", "app.js"})
             self.assertEqual(set(graph["style.css"]), {"theme.css"})
             self.assertEqual(set(graph["app.js"]), {"math.js", "util.js"})
             self.assertEqual(graph["main.c"], ["math.h"])
+
+    def test_python_call_graph_and_importance_are_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = {
+                "main.py": "from service import run\n\nif __name__ == '__main__':\n    print(run())\n",
+                "service.py": "from math_utils import add\n\ndef run():\n    return add(2, 3)\n",
+                "math_utils.py": "def add(a, b):\n    return a + b\n",
+                "tests/test_service.py": "import unittest\nfrom service import run\n\nclass T(unittest.TestCase):\n    def test_run(self):\n        self.assertEqual(run(), 5)\n",
+            }
+            os.makedirs(os.path.join(tmp, "tests"))
+            for rel_path, content in files.items():
+                with open(os.path.join(tmp, rel_path), "w", encoding="utf-8") as f:
+                    f.write(content)
+
+            analysis = analyze_repo(tmp)
+
+            call_edges = {
+                (edge["caller"], edge["callee"])
+                for edge in analysis["call_graph"]
+            }
+            important_paths = [item["relative"] for item in analysis["important_files"][:3]]
+
+            self.assertIn(("service.py:run", "math_utils.py:add"), call_edges)
+            self.assertIn("main.py", important_paths)
 
     def test_write_file_removes_stale_python_cache(self):
         with tempfile.TemporaryDirectory() as tmp:

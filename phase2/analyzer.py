@@ -56,6 +56,15 @@ def analyze_repo(repo_path: str) -> dict:
         lang_counts[lang] = lang_counts.get(lang, 0) + 1
         total_funcs += len(f.get("functions", []))
 
+    dependency_graph = extract_dependency_graph(abs_path, file_infos)
+    reverse_dependency_graph = build_reverse_dependency_graph(dependency_graph)
+    call_graph = extract_function_call_graph(file_infos)
+    code_tree = build_hierarchical_code_tree(file_infos)
+    important_files = rank_important_files(file_infos, dependency_graph, reverse_dependency_graph)
+    importance_by_path = {item["relative"]: item["score"] for item in important_files}
+    for f in file_infos:
+        f["importance"] = importance_by_path.get(f["relative"], 0)
+
     summary_parts = [f"{count} {lang}" for lang, count in sorted(lang_counts.items())]
     summary = f"{len(file_infos)} files ({', '.join(summary_parts)}), {total_funcs} functions"
 
@@ -65,12 +74,41 @@ def analyze_repo(repo_path: str) -> dict:
         "path": abs_path,
         "files": file_infos,
         "summary": summary,
+        "dependency_graph": dependency_graph,
+        "reverse_dependency_graph": reverse_dependency_graph,
+        "call_graph": call_graph,
+        "code_tree": code_tree,
+        "important_files": important_files,
     }
 
 
 def get_repo_map_text(analysis: dict) -> str:
     """Generate a compact repo map string for LLM context."""
     lines = [f"Repository: {analysis['path']}", f"Summary: {analysis['summary']}", ""]
+
+    important = analysis.get("important_files", [])[:8]
+    if important:
+        lines.append("Important files:")
+        for item in important:
+            reasons = ", ".join(item.get("reasons", [])[:3])
+            reason_text = f" — {reasons}" if reasons else ""
+            lines.append(f"   {item['relative']}  score={item['score']}{reason_text}")
+        lines.append("")
+
+    dep_graph = analysis.get("dependency_graph", {})
+    if dep_graph:
+        lines.append("Module dependency graph:")
+        for src, deps in list(dep_graph.items())[:20]:
+            if deps:
+                lines.append(f"   {src} -> {', '.join(deps[:5])}")
+        lines.append("")
+
+    call_graph = analysis.get("call_graph", [])
+    if call_graph:
+        lines.append("Function call graph:")
+        for edge in call_graph[:20]:
+            lines.append(f"   {edge['caller']} -> {edge['callee']}")
+        lines.append("")
 
     for f in analysis["files"]:
         lines.append(f"{f['relative']}  ({f['language']}, {f['size']}B)")
@@ -81,7 +119,9 @@ def get_repo_map_text(analysis: dict) -> str:
         if f.get("functions"):
             for func in f["functions"]:
                 args_str = ", ".join(func["args"][:4])
-                lines.append(f"   def {func['name']}({args_str})  L{func['lineno']}")
+                calls = func.get("calls", [])
+                call_text = f" calls: {', '.join(calls[:5])}" if calls else ""
+                lines.append(f"   def {func['name']}({args_str})  L{func['lineno']}{call_text}")
 
         if f.get("classes"):
             for cls in f["classes"]:
@@ -160,6 +200,7 @@ def _analyze_python(filepath: str, info: dict) -> bool:
                 "lineno": node.lineno,
                 "end_lineno": getattr(node, "end_lineno", node.lineno),
                 "args": [arg.arg for arg in node.args.args],
+                "calls": _extract_python_calls(node),
             })
 
         elif isinstance(node, ast.ClassDef):
@@ -183,6 +224,37 @@ def _analyze_python(filepath: str, info: dict) -> bool:
                 info["imports"].append(f"{module}.{alias.name}")
     
     return True
+
+
+def _extract_python_calls(node: ast.AST) -> list:
+    """Extract function or method call names from a Python AST node."""
+    calls = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+
+        name = ""
+        if isinstance(child.func, ast.Name):
+            name = child.func.id
+        elif isinstance(child.func, ast.Attribute):
+            name = _attribute_to_name(child.func)
+
+        if name and name not in calls:
+            calls.append(name)
+    return calls
+
+
+def _attribute_to_name(node: ast.Attribute) -> str:
+    """Convert an attribute expression to a dotted name when possible."""
+    parts = [node.attr]
+    value = node.value
+    while isinstance(value, ast.Attribute):
+        parts.append(value.attr)
+        value = value.value
+    if isinstance(value, ast.Name):
+        parts.append(value.id)
+    parts.reverse()
+    return ".".join(parts)
 
 
 # ─── Dependency Graph ───────────────────────────────────────
@@ -289,6 +361,131 @@ def extract_dependency_graph(repo_path: str, file_infos: list) -> dict:
     return graph
 
 
+def build_reverse_dependency_graph(dependency_graph: dict) -> dict:
+    """Build {file: [files_that_depend_on_it]} from a dependency graph."""
+    reverse = {src: [] for src in dependency_graph}
+    for src, deps in dependency_graph.items():
+        for dep in deps:
+            reverse.setdefault(dep, [])
+            if src not in reverse[dep]:
+                reverse[dep].append(src)
+    return reverse
+
+
+def extract_function_call_graph(file_infos: list) -> list:
+    """
+    Build lightweight function call edges using Python AST call names.
+    Edges are best-effort and intentionally conservative.
+    """
+    function_index = {}
+    for fi in file_infos:
+        if fi.get("language") != "python":
+            continue
+        for func in fi.get("functions", []):
+            node_id = f"{fi['relative']}:{func['name']}"
+            function_index.setdefault(func["name"], []).append(node_id)
+
+    edges = []
+    seen = set()
+    for fi in file_infos:
+        if fi.get("language") != "python":
+            continue
+        for func in fi.get("functions", []):
+            caller = f"{fi['relative']}:{func['name']}"
+            for call in func.get("calls", []):
+                short = call.split(".")[-1]
+                for callee in function_index.get(short, []):
+                    if callee == caller:
+                        continue
+                    key = (caller, callee)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    edges.append({"caller": caller, "callee": callee})
+    return edges
+
+
+def build_hierarchical_code_tree(file_infos: list) -> dict:
+    """
+    Build a lightweight package -> file -> symbols tree inspired by RepoMaster's HCT.
+    """
+    root = {"name": "", "type": "directory", "children": {}, "files": []}
+    for fi in sorted(file_infos, key=lambda item: item["relative"]):
+        parts = _norm_rel(fi["relative"]).split("/")
+        node = root
+        for part in parts[:-1]:
+            node = node["children"].setdefault(
+                part,
+                {"name": part, "type": "directory", "children": {}, "files": []},
+            )
+        node["files"].append({
+            "name": parts[-1],
+            "relative": fi["relative"],
+            "language": fi["language"],
+            "functions": [func["name"] for func in fi.get("functions", [])],
+            "classes": [cls["name"] for cls in fi.get("classes", [])],
+        })
+    return root
+
+
+def rank_important_files(file_infos: list, dependency_graph: dict, reverse_dependency_graph: dict) -> list:
+    """
+    Rank files by structural importance.
+    Uses RepoMaster-style signals: dependency centrality, entry-like names,
+    code symbols, syntax errors, and semantic filename hints.
+    """
+    entry_names = {"main.py", "app.py", "run.py", "start.py", "__main__.py", "server.py"}
+    semantic_keywords = {
+        "core", "main", "app", "server", "agent", "router", "service",
+        "manager", "processor", "pipeline", "executor", "config", "model",
+    }
+    ranked = []
+    for fi in file_infos:
+        rel = fi["relative"]
+        base = os.path.basename(rel).lower()
+        stem = os.path.splitext(base)[0]
+        reasons = []
+        score = 0
+
+        incoming = len(reverse_dependency_graph.get(rel, []))
+        outgoing = len(dependency_graph.get(rel, []))
+        if incoming:
+            score += incoming * 4
+            reasons.append(f"imported_by={incoming}")
+        if outgoing:
+            score += outgoing * 2
+            reasons.append(f"depends_on={outgoing}")
+
+        if base in entry_names:
+            score += 8
+            reasons.append("entry_candidate")
+        if stem in semantic_keywords or any(word in stem for word in semantic_keywords):
+            score += 3
+            reasons.append("semantic_name")
+
+        symbol_count = len(fi.get("functions", [])) + len(fi.get("classes", []))
+        if symbol_count:
+            score += min(symbol_count, 6)
+            reasons.append(f"symbols={symbol_count}")
+
+        if fi.get("has_syntax_error"):
+            score += 10
+            reasons.append("syntax_error")
+
+        if _looks_like_test_file(rel):
+            score -= 5
+            reasons.append("test_file")
+
+        ranked.append({
+            "relative": rel,
+            "score": round(score, 2),
+            "reasons": reasons,
+        })
+
+    ranked.sort(key=lambda item: (-item["score"], item["relative"]))
+    return ranked
+
+
 def _extract_js_imports(source: str) -> list:
     """Extract import/require references from JavaScript or TypeScript."""
     refs = []
@@ -376,6 +573,22 @@ def _is_local_asset_ref(ref: str) -> bool:
         or lowered.startswith("data:")
         or lowered.startswith("mailto:")
         or lowered.startswith("tel:")
+    )
+
+
+def _looks_like_test_file(rel_path: str) -> bool:
+    """Return True for common test-file naming conventions."""
+    norm = _norm_rel(rel_path).lower()
+    base = os.path.basename(norm)
+    return (
+        norm.startswith("tests/")
+        or "/tests/" in norm
+        or base.startswith("test_")
+        or base.endswith("_test.py")
+        or base.endswith(".test.js")
+        or base.endswith(".spec.js")
+        or base.endswith(".test.ts")
+        or base.endswith(".spec.ts")
     )
 
 

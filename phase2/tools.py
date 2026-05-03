@@ -16,6 +16,8 @@ patch_function is permanently REMOVED.
 import os
 from utils.logger import log
 from utils.file_ops import read_file, write_file, search_files
+from utils.validator import validate_syntax
+from utils.safe_edit import patch_file as _patch_file_impl
 from utils.executor import run_code, run_tests, can_execute, NON_EXECUTABLE
 
 
@@ -55,14 +57,18 @@ TOOLS = {
         "description": "Search for a string in all files within a directory",
         "parameters": {"directory": "string (directory path)", "query": "string (search term)"},
     },
+    "patch_file": {
+        "description": "Apply partial edits to a file using search/replace blocks. Safer than write_file for modifying existing files.",
+        "parameters": {"path": "string (file path)", "edits": "list of {search, replace} dicts"},
+    },
 }
 
 
 # ─── Tool Name Normalization ────────────────────────────────
 
 TOOL_ALIASES = {
-    "edit_file": "write_file",
-    "edit": "write_file",
+    "edit_file": "patch_file",
+    "edit": "patch_file",
     "read": "read_file",
     "run": "run_code",
     "test": "run_tests",
@@ -70,10 +76,11 @@ TOOL_ALIASES = {
     "run_test": "run_tests",
     "search": "search_files",
     "create_file": "write_file",
+    "patch": "patch_file",
 }
 
 # Blocked tools — will return an error if LLM tries to use them
-BLOCKED_TOOLS = {"patch_function", "list_directory"}
+BLOCKED_TOOLS = {"list_directory"}
 
 
 def normalize_tool_name(name: str) -> str:
@@ -91,6 +98,51 @@ def get_tools_description() -> str:
         params = ", ".join(f"{k}: {v}" for k, v in info["parameters"].items())
         lines.append(f"  {name}({params}) -- {info['description']}")
     return "\n".join(lines)
+
+
+def get_tools_prompt() -> str:
+    """
+    Generate a detailed tool usage guide for SWE-agent system prompt.
+    The LLM uses this to understand what tools are available and their JSON format.
+    """
+    return """## AVAILABLE TOOLS
+
+You MUST respond with a JSON object containing "thought" and "action" fields.
+
+### read_file
+Read a file's contents.
+{"thought": "I need to read this file to understand the code", "action": {"tool": "read_file", "path": "filename.py"}}
+
+### write_file
+Write/overwrite a file. Content must be the COMPLETE file.
+{"thought": "I will write the fixed file", "action": {"tool": "write_file", "path": "filename.py", "content": "ENTIRE FILE CONTENT"}}
+
+### patch_file
+Apply targeted search/replace edits (safer than write_file for existing files).
+{"thought": "I will fix the specific function", "action": {"tool": "patch_file", "path": "filename.py", "edits": [{"search": "old code", "replace": "new code"}]}}
+
+### run_code
+Execute a file and see output/errors.
+{"thought": "Let me run the code to check for errors", "action": {"tool": "run_code", "path": "filename.py"}}
+
+### run_tests
+Run the test suite.
+{"thought": "Let me verify with tests", "action": {"tool": "run_tests"}}
+
+### search_files
+Search for a string across all files.
+{"thought": "I need to find where this function is defined", "action": {"tool": "search_files", "directory": ".", "query": "function_name"}}
+
+### done
+Signal that the task is complete.
+{"thought": "The bug is fixed and tests pass", "action": {"tool": "done"}, "summary": "Fixed the issue by..."}
+
+## RULES
+- Always include "thought" explaining your reasoning
+- Use read_file BEFORE editing to understand the code
+- Use run_code or run_tests AFTER editing to verify
+- NEVER guess file contents — always read first
+- Signal "done" when the task is complete or you cannot make progress"""
 
 
 # ─── File Type Guards ───────────────────────────────────────
@@ -144,6 +196,10 @@ def execute_tool(action: dict, repo_path: str = ".") -> str:
             content = action.get("content", "")
             if not content:
                 return "Error: No content provided for write_file"
+            # Pre-write syntax validation
+            valid, err = validate_syntax(content, path)
+            if not valid:
+                return f"Error: Syntax validation failed for {path}: {err}"
             success = write_file(path, content)
             return f"Successfully wrote to {path}" if success else f"Error writing to {path}"
 
@@ -184,6 +240,14 @@ def execute_tool(action: dict, repo_path: str = ".") -> str:
                     lines.append(f"  {fpath}:{lineno}: {line}")
                 return "\n".join(lines)
             return f"No matches found for '{query}'"
+
+        elif tool_name == "patch_file":
+            path = _resolve_path(action.get("path", action.get("file", "")), repo_path)
+            edits = action.get("edits", [])
+            if not edits:
+                return "Error: No edits provided for patch_file"
+            success, msg = _patch_file_impl(path, edits)
+            return msg if success else f"Error: {msg}"
 
         else:
             return f"Error: Unknown tool '{tool_name}'"

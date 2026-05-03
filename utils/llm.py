@@ -70,6 +70,55 @@ def query_llm_json(prompt: str, system_prompt: str = "") -> dict:
         return {}
 
 
+def query_llm_chat(messages: list, expect_json: bool = True) -> str:
+    """
+    Multi-turn chat with Ollama (SWE-agent style).
+    Sends the full message history and returns the assistant response.
+
+    Args:
+        messages: List of {"role": "system"|"user"|"assistant", "content": str}
+        expect_json: Whether to request JSON formatted output
+
+    Returns:
+        Response text (or parsed JSON string if expect_json=True)
+    """
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": LLM_TEMPERATURE,
+            "num_ctx": LLM_NUM_CTX,
+        },
+    }
+
+    if expect_json:
+        payload["format"] = "json"
+
+    try:
+        log("SYSTEM", f"Querying LLM chat ({OLLAMA_MODEL}, {len(messages)} messages)...")
+        resp = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
+        resp.raise_for_status()
+        result = resp.json().get("message", {}).get("content", "").strip()
+
+        if expect_json:
+            result = _extract_json(result)
+
+        return result
+
+    except requests.exceptions.ConnectionError:
+        log("ERROR", f"Cannot connect to Ollama at {OLLAMA_BASE_URL}")
+        return ""
+    except requests.exceptions.Timeout:
+        log("ERROR", f"Ollama chat timed out after {OLLAMA_TIMEOUT}s")
+        return ""
+    except Exception as e:
+        log("ERROR", f"LLM chat failed: {e}")
+        return ""
+
+
 def _extract_json(text: str) -> str:
     """
     Extract the first JSON object or array from LLM output.
