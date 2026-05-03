@@ -600,3 +600,150 @@ def _clean_asset_ref(ref: str) -> str:
 def _norm_rel(path: str) -> str:
     """Normalize a relative path while preserving repo-relative semantics."""
     return os.path.normpath(path).replace("\\", "/")
+
+
+# ─── Semantic Dependency Graph (FIX POINT 1) ────────────────
+
+MAX_LINES_FOR_AST = 10000  # FIX POINT 5: skip huge files
+
+
+def build_semantic_graph(file_infos: list, import_graph: dict = None) -> dict:
+    """
+    Build a semantic dependency graph that combines:
+      1. Import-level dependencies (from extract_dependency_graph)
+      2. Function-call-level cross-file dependencies (from AST)
+
+    Returns same format as extract_dependency_graph:
+        {"main.py": ["service.py", "utils.py"], ...}
+
+    Falls back to import_graph if AST analysis fails.
+    """
+    # Start with import graph as base
+    graph = {}
+    if import_graph:
+        for src, deps in import_graph.items():
+            graph[src] = list(deps)
+
+    # Build function_name → file mapping
+    function_to_file = {}
+    for fi in file_infos:
+        rel = fi.get("relative", "")
+        # FIX POINT 5: skip large files
+        if fi.get("size", 0) > MAX_LINES_FOR_AST * 80:  # ~80 chars/line
+            continue
+        for func in fi.get("functions", []):
+            fname = func.get("name", "")
+            if fname and fname not in ("__init__", "__str__", "__repr__"):
+                function_to_file.setdefault(fname, rel)
+        for cls in fi.get("classes", []):
+            cname = cls.get("name", "")
+            if cname:
+                function_to_file.setdefault(cname, rel)
+
+    # Map calls → files to find cross-file semantic edges
+    for fi in file_infos:
+        rel = fi.get("relative", "")
+        if fi.get("size", 0) > MAX_LINES_FOR_AST * 80:
+            continue
+        graph.setdefault(rel, [])
+
+        for func in fi.get("functions", []):
+            for call_name in func.get("calls", []):
+                # Strip module prefix: obj.method → method
+                short = call_name.split(".")[-1]
+                target_file = function_to_file.get(short, "")
+                if target_file and target_file != rel and target_file not in graph[rel]:
+                    graph[rel].append(target_file)
+
+    return graph
+
+
+def get_reverse_deps(dep_graph: dict, target: str) -> list:
+    """
+    FIX POINT 4: Get files that depend on the target file (reverse deps).
+    Useful for understanding impact of changes.
+    """
+    reverse = []
+    for src, deps in dep_graph.items():
+        if target in deps and src not in reverse:
+            reverse.append(src)
+    return reverse
+
+
+# ─── Terminal Graph Visualization (FIX POINT 3) ─────────────
+
+def print_dependency_graph(dep_graph: dict, title: str = "Dependency Graph") -> str:
+    """
+    Generate a tree-like terminal visualization of the dependency graph.
+    
+    Returns the visualization as a string (also logs it).
+    
+    Example output:
+        Dependency Graph:
+        main.py
+        ├── service.py
+        │   └── utils.py
+        └── config.py
+    """
+    if not dep_graph:
+        return f"{title}: (empty)"
+
+    # Find root nodes (files not imported by anyone, or all files if no clear root)
+    all_files = set(dep_graph.keys())
+    imported = set()
+    for deps in dep_graph.values():
+        imported.update(deps)
+    roots = all_files - imported
+    if not roots:
+        roots = all_files  # No clear hierarchy, show all
+
+    lines = [f"{title}:"]
+    visited = set()
+
+    def _render_tree(node: str, prefix: str = "", is_last: bool = True):
+        """Recursively render a tree node."""
+        if node in visited:
+            lines.append(f"{prefix}{'└── ' if is_last else '├── '}{node} (circular)")
+            return
+        visited.add(node)
+
+        connector = "└── " if is_last else "├── "
+        lines.append(f"{prefix}{connector}{node}")
+
+        children = dep_graph.get(node, [])
+        child_prefix = prefix + ("    " if is_last else "│   ")
+        for i, child in enumerate(children):
+            _render_tree(child, child_prefix, i == len(children) - 1)
+
+    # Render each root
+    sorted_roots = sorted(roots)
+    for i, root in enumerate(sorted_roots):
+        if i > 0:
+            lines.append("")  # spacing between trees
+        is_last_root = (i == len(sorted_roots) - 1)
+        # Root nodes get no prefix
+        if root in visited:
+            continue
+        visited.add(root)
+        lines.append(f"  {root}")
+        children = dep_graph.get(root, [])
+        for j, child in enumerate(children):
+            _render_tree(child, "  ", j == len(children) - 1)
+
+    output = "\n".join(lines)
+    log("INFO", output)
+    return output
+
+
+def format_graph_compact(dep_graph: dict) -> str:
+    """
+    Format dependency graph as compact arrow notation.
+    Useful for LLM context where tree format is too verbose.
+    
+    Example: main.py → service.py, utils.py
+    """
+    lines = []
+    for src, deps in sorted(dep_graph.items()):
+        if deps:
+            lines.append(f"  {src} → {', '.join(deps)}")
+    return "\n".join(lines) if lines else "  (no dependencies)"

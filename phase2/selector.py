@@ -18,10 +18,15 @@ _WEB_LANGUAGES = {"html", "css", "javascript", "typescript"}
 
 
 def select_context(task: str, repo_analysis: dict, max_files: int = 3,
-                    retrieval_results: list = None) -> list:
+                    retrieval_results: list = None,
+                    recently_edited: list = None) -> list:
     """
     Select the most relevant files for a task.
     Combines heuristic ranking with retrieval scores when available.
+    Boosts recently edited files for continuity.
+
+    Args:
+        recently_edited: list of relative paths recently modified by the agent
 
     Returns list of dicts:
         [{"path": str, "relative": str, "content": str, "reason": str}]
@@ -40,6 +45,10 @@ def select_context(task: str, repo_analysis: dict, max_files: int = 3,
     # Merge retrieval scores if available
     if retrieval_results:
         scored = _merge_retrieval_scores(scored, retrieval_results)
+
+    # Boost recently edited files (Problem 7: recency weighting)
+    if recently_edited:
+        scored = _boost_recently_edited(scored, recently_edited)
 
     selected = scored[:max_files]
 
@@ -149,6 +158,26 @@ def _merge_retrieval_scores(scored: list, retrieval_results: list) -> list:
             bonus = int(retrieval_map[rel] * 15)
             item["_score"] += bonus
             log("CONTEXT", f"Retrieval boost: {rel} +{bonus} (similarity={retrieval_map[rel]:.3f})")
+
+    scored.sort(key=lambda x: (-x["_score"], x["size"]))
+    return scored
+
+
+def _boost_recently_edited(scored: list, recently_edited: list) -> list:
+    """
+    Boost score for files recently modified by the agent.
+    Ensures continuity — the agent revisits files it already touched.
+    """
+    if not recently_edited:
+        return scored
+
+    edited_set = set(recently_edited)
+    for item in scored:
+        rel = item.get("relative", "")
+        if rel in edited_set:
+            bonus = 12
+            item["_score"] += bonus
+            log("CONTEXT", f"Recency boost: {rel} +{bonus} (recently edited)")
 
     scored.sort(key=lambda x: (-x["_score"], x["size"]))
     return scored

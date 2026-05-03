@@ -23,6 +23,7 @@ import os
 import re
 import ast
 import hashlib
+from enum import Enum
 from config import MAX_RETRIES, MAX_AGENT_STEPS
 from utils.logger import log, separator
 from utils.llm import query_llm_json
@@ -35,6 +36,23 @@ from phase2.planner import create_plan
 from phase2.selector import select_context
 from phase2.tools import execute_tool
 from phase2.retrieval import index_repo, query_relevant_code
+
+
+# ─── Agent Mode (Problem 6: Multi-Agent Role Separation) ───
+class AgentMode(Enum):
+    """Explicit agent modes for role-specific behavior."""
+    PLANNING   = "planning"    # Decompose task into steps
+    EXECUTING  = "executing"   # Perform code changes
+    DEBUGGING  = "debugging"   # Analyze errors and fix
+    CREATING   = "creating"    # Generate new code
+
+
+MODE_SYSTEM_HINTS = {
+    AgentMode.PLANNING: "You are in PLANNING mode. Focus on breaking the task into steps. Do NOT write code yet.",
+    AgentMode.EXECUTING: "You are in EXECUTING mode. Focus on making precise code changes. Follow the plan exactly.",
+    AgentMode.DEBUGGING: "You are in DEBUGGING mode. Focus on understanding the error, tracing its root cause, and generating a targeted fix.",
+    AgentMode.CREATING: "You are in CREATING mode. Focus on generating complete, working code files.",
+}
 # ─── Loop Protection (adapted from mini-swe-agent) ─────────
 class LoopProtector:
     """
@@ -210,31 +228,47 @@ def _retry_for_real_content(file_name: str, file_content: str) -> str:
     if resp and resp.get("content") and not _is_placeholder(resp["content"]):
         return resp["content"]
     return ""
-# \u2500\u2500\u2500 Entry Point \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-def run_agent(task: str, repo_path: str) -> dict:
+# ─── Entry Point ──────────────────────────────────────────
+def run_agent(task: str, repo_path: str, mode: str = "auto") -> dict:
     """
-    Main entry point.
-    Detects CREATE vs FIX mode and dispatches accordingly.
+    Unified entry point for all agent tasks.
+    
+    Args:
+        task: User's task description
+        repo_path: Path to the repository
+        mode: "auto" (detect CREATE/FIX), "swe" (force SWE loop), 
+              "create" (force CREATE), "fix" (force FIX)
+    
+    Uses AgentMode for explicit role separation.
     Returns: {"success": bool, "summary": str, "steps": int}
     """
     separator("AGENT START")
     log("PLAN", f"Task: {task}")
     abs_repo = os.path.abspath(repo_path)
-    if _is_create_task(task):
-        log("THOUGHT", "Task classified as CREATE mode")
+
+    # Determine agent mode
+    if mode == "swe":
+        agent_mode = AgentMode.DEBUGGING
+        log("THOUGHT", f"Task dispatched to SWE loop ({agent_mode.value} mode)")
+        from phase2.swe_loop import run_swe_agent
+        return run_swe_agent(task, abs_repo)
+
+    if mode == "create" or (mode == "auto" and _is_create_task(task)):
+        agent_mode = AgentMode.CREATING
+        log("THOUGHT", f"Task classified as {agent_mode.value.upper()} mode")
         return _run_create(task, abs_repo)
-    log("THOUGHT", "Task classified as FIX mode")
+
+    agent_mode = AgentMode.PLANNING
+    log("THOUGHT", f"Task classified as FIX mode (starting in {agent_mode.value} phase)")
     return _run_fix(task, abs_repo)
 
 
 def run_agent_swe(task: str, repo_path: str, max_steps: int = 15) -> dict:
     """
     Run the SWE-agent conversational loop.
-    Uses multi-turn chat where the LLM accumulates context and chooses tools.
-    Better for complex/vague tasks like 'fix the grid button'.
+    Delegates to unified run_agent with mode='swe'.
     """
-    from phase2.swe_loop import run_swe_agent
-    return run_swe_agent(task, repo_path, max_steps=max_steps)
+    return run_agent(task, repo_path, mode="swe")
 
 
 # ─── FIX Mode ───────────────────────────────────────────────
