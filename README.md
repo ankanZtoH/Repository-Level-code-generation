@@ -298,3 +298,7 @@ The analyzer also builds lightweight dependency edges for Python imports, JS/TS 
 ## 📄 License
 
 MIT — Use freely for research, learning, and experimentation.
+
+
+
+Create a simple counter app using HTML, CSS, and JavaScript with two buttons (+ and -) to increase and decrease a displayed value, using separate files (index.html, style.css, script.js) with complete working code.
